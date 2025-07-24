@@ -50,7 +50,7 @@ class GRPOConfig(GRPOConfig):
     )
     img_size: int = field(default=512, metadata={"help": "The size of the image to generate"})
     patch_size: int = field(default=16, metadata={"help": "The patch size of the image to generate"})
-    
+    deepspeed: bool = field(default=False)
     # max_textcot_length: int = field(default=None, metadata={"help": "The maximum length of the text cot"})
     # hps_ckpt_path: str = field(default=None, metadata={"help": "The path to the hps checkpoint"})
     # git_ckpt_path: str = field(default=None, metadata={"help": "The path to the git checkpoint"})
@@ -67,7 +67,7 @@ class GRPOScriptArguments(ScriptArguments):
         reward_funcs (`list[str]`):
             List of reward functions. Possible values: 'accuracy', 'format', 'hps', 'git', 'gdino'.
     """
-    num_gen: int = field(default=3, metadata={"help": "The number of new generations of image to generate"})
+    num_gen: int = field(default=1, metadata={"help": "The number of new generations of image to generate"})
     image_size: int = field(default=512, metadata={"help": "The size of the image to generate"})
     reward_funcs: list[str] = field(
         default_factory=lambda: ["test"],
@@ -91,7 +91,7 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Name of the training task"}
     )
     pre_trained_ckpt_name: str = field(
-        default="4_28_stage_2",
+        default="/home/daigaole/code/ex/adrien_brody/4_28_stage_2",
         metadata={"help": "Name of the pre-trained checkpoint"}
     )
     t2i_data: bool = field(
@@ -135,7 +135,7 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Number of epochs between evaluations"}
     )
     epoch: int = field(
-        default=20,
+        default=10,
         metadata={"help": "Total number of training epochs"}
     )
     epoch_to_load: int = field(
@@ -226,7 +226,8 @@ def update_tokens_load_from_pretrained(args,
                                        epoch_to_load, 
                                        nums_new_token_i_stage_1=16,
                                        nums_new_token_i_stage_2=8,
-                                       need_init=True):
+                                       need_init=True,
+                                       second_time=False):
     ckpt_path = os.path.join("../", concept, pre_trained_ckpt_name)
     ckpt_embed_path = os.path.join(ckpt_path, f"epoch_{epoch_to_load}_embed.pt")
     ckpt_lm_head_weight_path = os.path.join(ckpt_path, f"epoch_{epoch_to_load}_lm_head_weight.pt")
@@ -239,7 +240,10 @@ def update_tokens_load_from_pretrained(args,
     num_new_tokens = len(new_tokens)  # 16 + 8 + 1 
 
     # 文本 token 数量（ID 0-50304）
-    original_text_vocab_size = len(tokenizer) 
+    if second_time:
+        original_text_vocab_size = len(tokenizer)-num_new_tokens
+    else:
+        original_text_vocab_size = len(tokenizer)
     # Image token 数量（原 ID 50305-58497）
     original_image_vocab_size = model.showo.get_input_embeddings().num_embeddings - len(tokenizer)
     original_total_vocab = original_text_vocab_size + original_image_vocab_size  # 58498
@@ -253,7 +257,8 @@ def update_tokens_load_from_pretrained(args,
     # ------------------------------
 
     # 添加新 token 到 50305-50321 的位置
-    num_new_tokens = tokenizer.add_tokens(new_tokens)
+    if not second_time:
+        num_new_tokens = tokenizer.add_tokens(new_tokens)
     new_token_ids = tokenizer.convert_tokens_to_ids(new_tokens)
     print("新 token ID:", new_token_ids)  # 应输出 50305-50329
     sks_token_id = tokenizer.convert_tokens_to_ids(sks_token)
@@ -365,6 +370,7 @@ def update_tokens_load_from_pretrained(args,
 
     # 检查一个原 Image Token 的新 ID
     sample_image_token = tokenizer.convert_ids_to_tokens(original_text_vocab_size)  # 原 ID 50305
+    print(sample_image_token)
     print(f"Concept Token '{sample_image_token}' 的新 ID:", tokenizer.convert_tokens_to_ids(sample_image_token))  # 应输出 50322
 
     # 检查嵌入层形状
@@ -416,11 +422,14 @@ def test_showo(model,image_path):
 def main(args, training_args, model_args):
     # Get reward functions
     reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
-
+    if training_args.deepspeed:
+        with open(training_args.deepspeed, "r") as f:
+            training_args.deepspeed = json.load(f)
     #get initial model
     config = OmegaConf.load(args.config_file)
     tokenizer, uni_prompting, vq_model, model= setup_model(args, config)
-    test_showo(model,'/home/daigaole/code/ex/dataset/unictokens_data/black_512x512.png')
+    ref_tokenizer,_,_,ref_model=setup_model(args, config)
+    # test_showo(model,'/home/daigaole/code/ex/dataset/unictokens_data/black_512x512.png')
     #make filepath to save the result
     data_root = args.data_root
     concept = args.concept
@@ -437,13 +446,23 @@ def main(args, training_args, model_args):
                                          nums_new_token_i_stage_2=args.nums_new_token_i_stage_2,
                                          need_init=True
                                          )
+    ref_tokenizer, ref_model,_,_, \
+    _,_,_,_,_,_ \
+    = update_tokens_load_from_pretrained(args, concept, ref_tokenizer, ref_model, 
+                                         args.pre_trained_ckpt_name, 
+                                         args.epoch_to_load,
+                                         nums_new_token_i_stage_1=args.nums_new_token_i_stage_1,
+                                         nums_new_token_i_stage_2=args.nums_new_token_i_stage_2,
+                                         need_init=True
+                                         )
     config.new_total_vocab=new_total_vocab
     # set up parameters
     vq_model.requires_grad_ = False
     vq_model.eval()
     model.train()
     optimizer=check_param(model,args)
-
+    if training_args.deepspeed:
+        model = model.to(torch.float16)
     # set up dataset
     if args.t2i_data:
         load_caption_training_path = os.path.join("saves", concept, args.pre_trained_ckpt_name, "captions.json")
@@ -490,6 +509,7 @@ def main(args, training_args, model_args):
     # Initialize the GRPO trainer
     trainer = trainer_cls(
         model=model,
+        ref_model=ref_model,
         reward_funcs=reward_funcs,
         args=args,
         train_args=training_args,
@@ -499,13 +519,14 @@ def main(args, training_args, model_args):
         uni_prompting=uni_prompting,
         optimizer=optimizer,
         tokenizer=tokenizer,
+        ref_tokenizer=ref_tokenizer,
         # eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
         peft_config=get_peft_config(model_args),
         attn_implementation=model_args.attn_implementation,
     )
 
     # Train and push the model to the Hub
-    trainer.train()
+    trainer.train(vq_model)
 
     # Save and push to hub
     trainer.save_model(training_args.output_dir)
@@ -533,6 +554,7 @@ def main(args, training_args, model_args):
 #     print(f"{prefix}")
 
 import sys
+import json
 if __name__ == "__main__":
     print(sys.executable)
     parser = TrlParser((GRPOScriptArguments, GRPOConfig, ModelConfig))
