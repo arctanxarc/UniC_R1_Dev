@@ -389,11 +389,11 @@ def update_tokens_load_from_pretrained(args,
            index_no_updates, new_total_vocab, new_token_ids, adj_token_ids, sks_token_id
 def check_param(model,args):
     #need to modify
-    # for name, param in model.named_parameters():
-    #     if "embed_tokens" in name or "lm_head" in name:
-    #         param.requires_grad = True
-    #     else:
-    #         param.requires_grad = False
+    for name, param in model.named_parameters():
+        if "embed_tokens" in name or "lm_head" in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
 
     #statistic
     trainable_params = []

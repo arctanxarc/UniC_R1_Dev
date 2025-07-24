@@ -140,7 +140,7 @@ class unic_grpo(Trainer):
         #     from deepspeed import zero
         #     self.model, _ = deepspeed.initialize(model=model, config_params=train_args.deepspeed)
         #     self.ref_model, _ = deepspeed.initialize(model=self.ref_model, config_params=train_args.deepspeed, eval_mode=True)
-        
+
         # # Reward functions
         # if not isinstance(reward_funcs, list):
         #     reward_funcs = [reward_funcs]
@@ -488,18 +488,19 @@ class unic_grpo(Trainer):
                 rewards2=torch.tensor(reward2_list).float().reshape(self.num_generations*batch_size_t2i*self.group).to(self.args.device)
 
                 #gpt-4o reward
-                # reward3_list=[]
-                # prompt='How much do you think the man in the first image appears in the second image?\nPlease use a number ranging from 0 to 1 to represent.\nPlease only output a number.\n'
-                # ref_path='/home/daigaole/code/ex/dataset/unictokens_data/concept/train/adrien_brody/0.png'
-                # for path in path_list:
-                #     answer=chat_with_images_gpt(prompt,[ref_path,path])
-                #     answer=extract_single_number(answer)
-                #     print(path,'gpt score:',answer)
-                #     reward3_list.append(answer)
-                # rewards3=torch.tensor(reward3_list).float().reshape(self.num_generations*batch_size_t2i*self.group).to(self.args.device)
+                reward3_list=[]
+                prompt='How much do you think the man in the first image appears in the second image?\nPlease use a number ranging from 0 to 1 to represent.\nPlease only output a number.\n'
+                ref_path='/home/daigaole/code/ex/dataset/unictokens_data/concept/train/adrien_brody/0.png'
+                for path in path_list:
+                    answer=chat_with_images_gpt(prompt,[ref_path,path])
+                    answer=extract_single_number(answer)
+                    print(path,'gpt score:',answer)
+                    reward3_list.append(answer)
+                rewards3=torch.tensor(reward3_list).float().reshape(self.num_generations*batch_size_t2i*self.group).to(self.args.device)
 
-                # rewards=rewards2*0.2+rewards3*0.8
-                rewards=rewards2
+                rewards=rewards2*0.2+rewards3*0.8
+                print(rewards)
+                # rewards=rewards2
                 per_token_logps=logits
                 ref_per_token_logps=self.save_logits
                 # print(rewards,per_token_logps,ref_per_token_logps)
@@ -521,8 +522,8 @@ class unic_grpo(Trainer):
                 per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
                 per_token_loss = -(per_token_loss - self.beta * per_token_kl)
                 print('sum of kl',per_token_kl.sum())
-                # print("per_token_loss shape:", per_token_loss.shape)  # å®žé™…å½¢çŠ¶
-                # print("completion_mask shape:", completion_mask.shape)  # åº”è¯¥æ˜¯ (8, 1024)
+                # print("per_token_loss shape:", per_token_loss.shape)  # Êµ¼ÊÐÎ×´
+                # print("completion_mask shape:", completion_mask.shape)  # Ó¦¸ÃÊÇ (8, 1024)
                 completion_mask = completion_mask.unsqueeze(-1)
                 # print(per_token_loss,per_token_kl)
                 loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
