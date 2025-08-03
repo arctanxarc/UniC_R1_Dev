@@ -522,8 +522,8 @@ class unic_grpo(Trainer):
                 per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
                 per_token_loss = -(per_token_loss - self.beta * per_token_kl)
                 print('sum of kl',per_token_kl.sum())
-                # print("per_token_loss shape:", per_token_loss.shape)  # Êµ¼ÊÐÎ×´
-                # print("completion_mask shape:", completion_mask.shape)  # Ó¦¸ÃÊÇ (8, 1024)
+                # print("per_token_loss shape:", per_token_loss.shape)  # å®žé™…å½¢çŠ¶
+                # print("completion_mask shape:", completion_mask.shape)  # åº”è¯¥æ˜¯ (8, 1024)
                 completion_mask = completion_mask.unsqueeze(-1)
                 # print(per_token_loss,per_token_kl)
                 loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
