@@ -1,561 +1,645 @@
 import os
-import re
-from datetime import datetime
-from dataclasses import dataclass, field
-from typing import Optional
-
-from datasets import load_dataset, load_from_disk
-# from transformers import Qwen2VLForConditionalGeneration
-from trl import GRPOConfig, GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
-
-import argparse
-from typing import Union
-from pdata import get_personalized_mmu_dataloader, get_personalized_t2i_dataloader, get_concept_info, get_concept_all_training_images_path, resize_img
-from lightning.pytorch.utilities import CombinedLoader
-from insightface.app import FaceAnalysis
-import cv2
-
-import torch
-from torch.utils.data import Dataset, DataLoader
-import torch.nn.functional as F
-import torch.nn as nn
-import numpy as np
-from tqdm import tqdm
+import textwrap
+from collections import defaultdict
+from typing import Any, Callable, Optional, Union
 from PIL import Image
-from torch.nn import Parameter
+from pdata import image_transform
+import numpy as np
+import torch
+import torch.utils.data
+import transformers
+import deepspeed
+from datasets import Dataset, IterableDataset
+from packaging import version
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
+from clip_eval import SHOWO_P_CLIPEvaluator
 from models import Showo, MAGVITv2, get_mask_chedule
+from clip.model import build_model
 from training.prompting_utils import UniversalPrompting, create_attention_mask_predict_next, create_attention_mask_for_mmu
+from transformers.integrations import is_deepspeed_zero3_enabled 
+from gpttest import chat_with_images_gpt
+from torch.utils.checkpoint import checkpoint
+from transformers import (
+
+    AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
+    AutoProcessor,
+    AutoTokenizer,
+    GenerationConfig,
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+
+    Trainer,
+    TrainerCallback,
+    is_wandb_available,
+)
+from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+from deepspeed import zero
+from transformers.utils import is_peft_available
 from training.utils import get_config, flatten_omega_conf, mask_or_random_replace_tokens, AverageMeter
-from transformers import AutoTokenizer
-from llava.llava import conversation as conversation_lib
+from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
+from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
+from trl.trainer.grpo_config import GRPOConfig
+from trl.trainer.utils import generate_model_card, get_comet_experiment_url
+import shutil
+
 import copy
-from omegaconf import DictConfig, ListConfig, OmegaConf
-from grpo import unic_grpo
-conversation_lib.default_conversation = conversation_lib.conv_templates["phi1.5"]
-if hasattr(torch, 'compile'):
-    torch._dynamo.config.suppress_errors = True
-    torch._dynamo.config.verbose = False
-# add image_generation_prompt in the GRPOConfig
-@dataclass
-class GRPOConfig(GRPOConfig):
-    """
-    Configuration class for the GRPO training script.
-    """
-    new_generations_image: int = field(default=1, metadata={"help": "The number of new generations of image to generate"})
-    # image_token_num_per_image: int = field(default=576, metadata={"help": "The number of image tokens to generate"})
-    # image_gen_temperature: float = field(default=1.0, metadata={"help": "The temperature for image generation"}) # HACK, this is always 1.0
-    cfg_weight: float = field(default=3.0, metadata={"help": "The cfg weight for image generation"})
-    reasoning_prompt_path: Optional[str] = field(
-        default='',
+import random
+import re
+def prepare_inputs_and_labels(
+        mask_id,
+        config,
+        vq_model,
+        uni_prompting,
+        mask_schedule,
+        pixel_values_or_image_ids: Union[torch.FloatTensor, torch.LongTensor],
+        texts: Union[str, str],
+        min_masking_rate: float = 0.0,
+        is_train: bool = True,
+):
+
+    image_tokens = vq_model.get_code(pixel_values_or_image_ids)
+    image_tokens = image_tokens + len(uni_prompting.text_tokenizer)
+
+    # create MLM mask and labels
+    input_ids, labels, loss_weight, mask_prob = mask_or_random_replace_tokens(
+        image_tokens,
+        mask_id,
+        config,
+        mask_schedule=mask_schedule,
+        is_train=is_train,
     )
-    img_size: int = field(default=512, metadata={"help": "The size of the image to generate"})
-    patch_size: int = field(default=16, metadata={"help": "The patch size of the image to generate"})
-    deepspeed: bool = field(default=False)
-    # max_textcot_length: int = field(default=None, metadata={"help": "The maximum length of the text cot"})
-    # hps_ckpt_path: str = field(default=None, metadata={"help": "The path to the hps checkpoint"})
-    # git_ckpt_path: str = field(default=None, metadata={"help": "The path to the git checkpoint"})
-    # gdino_ckpt_path: str = field(default=None, metadata={"help": "The path to the gdino checkpoint"})
-    # gdino_config_path: str = field(default=None, metadata={"help": "The path to the gdino config"})
-    # orm_ckpt_path: str = field(default=None, metadata={"help": "The path to the orm checkpoint"})
+    input_ids, masks, labels = uni_prompting((texts, input_ids, labels), 't2i')
+
+    return input_ids, labels, mask_prob, image_tokens
+def clone_model(model: torch.nn.Module) -> torch.nn.Module:
+    new_model = copy.deepcopy(model)
+    new_model.load_state_dict(copy.deepcopy(model.state_dict()))
+    new_model.to(next(model.parameters()).device)
     
-@dataclass
-class GRPOScriptArguments(ScriptArguments):
-    """
-    Script arguments for the GRPO training script.
-
-    Args:
-        reward_funcs (`list[str]`):
-            List of reward functions. Possible values: 'accuracy', 'format', 'hps', 'git', 'gdino'.
-    """
-    num_gen: int = field(default=4, metadata={"help": "The number of new generations of image to generate"})
-    image_size: int = field(default=512, metadata={"help": "The size of the image to generate"})
-    reward_funcs: list[str] = field(
-        default_factory=lambda: ["test"],
-        metadata={"help": "List of reward functions. Possible values: 'test'"},
-    )
-    tmp: int =field(default=22,metadata={"help":"to do a test"})
-    config_file: str = field(
-        default="configs/showo_demo_512x512.yaml",
-        metadata={"help": "Path to the configuration file"}
-    )
-    data_root: str = field(
-        default="/home/daigaole/code/ex/dataset/unictokens_data",
-        metadata={"help": "Root directory for the dataset"}
-    )
-    concept: str = field(
-        default="adrien_brody",
-        metadata={"help": "Concept for the model"}
-    )
-    task_name: str = field(
-        default="4_25(3)_mmu_stage2",
-        metadata={"help": "Name of the training task"}
-    )
-    pre_trained_ckpt_name: str = field(
-        default="/home/daigaole/code/ex/adrien_brody/4_28_stage_2",
-        metadata={"help": "Name of the pre-trained checkpoint"}
-    )
-    t2i_data: bool = field(
-        default=True,
-        metadata={"help": "Enable T2I data"}
-    )
-    mmu_data: bool = field(
-        default=False,
-        metadata={"help": "Enable MMU data"}
-    )
-    more_t2i_data: bool = field(
-        default=False,
-        metadata={"help": "Enable more T2I data"}
-    )
-    device: str = field(
-        default="cuda",
-        metadata={"help": "Device to use for training"}
-    )
-    t2i_bsz: int = field(
-        default=1,
-        metadata={"help": "Batch size for T2I data"}
-    )
-    mmu_bsz: int = field(
-        default=1,
-        metadata={"help": "Batch size for MMU data"}
-    )
-    save_training_image: bool = field(
-        default=False,
-        metadata={"help": "Save training images"}
-    )
-    l2_lambda: float = field(
-        default=0.0,
-        metadata={"help": "L2 regularization coefficient"}
-    )
-    caption_training: bool = field(
-        default=False,
-        metadata={"help": "Enable caption training"}
-    )
-    interval_epochs: int = field(
-        default=5,
-        metadata={"help": "Number of epochs between evaluations"}
-    )
-    epoch: int = field(
-        default=10,
-        metadata={"help": "Total number of training epochs"}
-    )
-    epoch_to_load: int = field(
-        default=15,
-        metadata={"help": "Epoch to load from the checkpoint"}
-    )
-    lr: float = field(
-        default=1e-6,
-        metadata={"help": "Learning rate"}
-    )
-    nums_new_token_i_stage_1: int = field(
-        default=16,
-        metadata={"help": "Number of new tokens in stage 1"}
-    )
-    nums_new_token_i_stage_2: int = field(
-        default=8,
-        metadata={"help": "Number of new tokens in stage 2"}
-    )
-    less_t2i_data: bool = field(
-        default=False,
-        metadata={"help": "Use less T2I data"}
-    )
-
-def make_detection_prompt(nouns):
-    if len(nouns) == 0:
-        return '', []
-    
-    token_spans = []
-    pointer = 0
-    for noun in nouns:
-        n_split = noun.strip().split(" ")
-        if len(n_split) == 1:
-            length = len(n_split[0])
-            token_spans.append([[pointer, pointer + length]])
-            pointer += length + 3 # on the blank space after the noun
-        else: # multiple words
-            beg_len = len(n_split[0])
-            total_length = len(noun)
-            end_len = len(n_split[-1])
-            token_spans.append([[pointer, pointer + beg_len], [pointer + total_length - end_len, pointer + total_length]])
-            pointer += total_length + 3 # on the blank space after the noun
-    text_prompt = ' . '.join(nouns) + "." # need to end with '.
-    return text_prompt, token_spans
+    return new_model
+def normalize_logits(logits, eps=1e-8):
+    mean = logits.mean(dim=-1, keepdim=True)
+    std = logits.std(dim=-1, keepdim=True)
+    return (logits - mean) / (std + eps) 
 
 
-reward_funcs_registry = {
-    'test':'test'
-}
+def extract_single_number(text):
+    match = re.fullmatch(r'\s*-?\d+\.?\d*\s*', text.strip())
+    if match:
+        num_str = match.group().strip()
+        return float(num_str) if '.' in num_str else int(num_str)
+    return 0.5
+class unic_grpo(Trainer):
+    def __init__(
+        self,
+        model,
+        # ref_model,
+        reward_funcs,
+        args,
+        train_args,
+        config,
+        dataset,
+        vq_model,
+        uni_prompting,
+        optimizer,
+        tokenizer,
+        # ref_tokenizer,
+        peft_config: Optional["PeftConfig"] = None,
+        attn_implementation: str = "flash_attention_2",
+    ):
 
-def setup_model(args, config):
-    tokenizer = AutoTokenizer.from_pretrained(config.model.showo.llm_model_path, padding_side ="left")
-    uni_prompting = UniversalPrompting(tokenizer, max_text_len=config.dataset.preprocessing.max_seq_length,
-                                       special_tokens=("<|soi|>", "<|eoi|>", "<|sov|>", "<|eov|>", "<|t2i|>", "<|mmu|>", "<|t2v|>", "<|v2v|>", "<|lvg|>"),
-                                       ignore_id=-100, cond_dropout_prob=config.training.cond_dropout_prob)
-    vq_model = MAGVITv2.from_pretrained(config.model.vq_model.vq_model_name).to(args.device)
-    model = Showo.from_pretrained(config.model.showo.pretrained_model_path,low_cpu_mem_usage=False).to(args.device)
-    return tokenizer, uni_prompting, vq_model, model
-
-
-def face_embed_init(args, concept, nums_new_token_i_stage_2):
-    training_images = get_concept_all_training_images_path(concept) # ["str", "str", ...]
-    training_images = [Image.open(img).convert("RGB") for img in training_images]
-    training_images = [resize_img(img) for img in training_images]
-    
-    app = FaceAnalysis(name='antelopev2', root='./', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-    app.prepare(ctx_id=0, det_size=(640, 640))
-
-    face_embs = []
-    for img in training_images:
-        face_info = app.get(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR))
-        face_info = sorted(face_info, key=lambda x:(x['bbox'][2]-x['bbox'][0])*(x['bbox'][3]-x['bbox'][1]))[-1] # only use the maximum face
-        face_emb = face_info['embedding']   # np array, shape: (512,)
-        face_emb = torch.from_numpy(face_emb) # shape: (512)
-        face_embs.append(face_emb)
-    face_embs_mean = torch.stack(face_embs).mean(dim=0) # torch.Size([512])
-    
-    # 512 / nums_new_token_i_stage_2 = n, face_embs_multi = 512 = [n, 512/nums_new_token_i_stage_2]
-    face_embs_multi = face_embs_mean.view(nums_new_token_i_stage_2, -1) # shape: [8, 64]
-    face_embs_multi = torch.nn.functional.interpolate(face_embs_multi.unsqueeze(0), size=(2048,), mode='linear').squeeze(0) # shape: [8, 2048]
-    
-    assert face_embs_multi.shape == (nums_new_token_i_stage_2, 2048)
-    return face_embs_multi
-def update_tokens_load_from_pretrained(args,
-                                       concept, 
-                                       tokenizer, 
-                                       model, 
-                                       pre_trained_ckpt_name, 
-                                       epoch_to_load, 
-                                       nums_new_token_i_stage_1=16,
-                                       nums_new_token_i_stage_2=8,
-                                       need_init=True,
-                                       second_time=False):
-    ckpt_path = os.path.join("../", concept, pre_trained_ckpt_name)
-    ckpt_embed_path = os.path.join(ckpt_path, f"epoch_{epoch_to_load}_embed.pt")
-    ckpt_lm_head_weight_path = os.path.join(ckpt_path, f"epoch_{epoch_to_load}_lm_head_weight.pt")
-    ckpt_lm_head_bias_path = os.path.join(ckpt_path, f"epoch_{epoch_to_load}_lm_head_bias.pt")
-
-    nums_total_token_i = nums_new_token_i_stage_1 + nums_new_token_i_stage_2
-    adj_tokens = [f"<token_{i}>" for i in range(nums_total_token_i)]
-    sks_token = [f"<{concept}>"]
-    new_tokens = sks_token + adj_tokens
-    num_new_tokens = len(new_tokens)  # 16 + 8 + 1 
-
-    # 文本 token 数量（ID 0-50304）
-    if second_time:
-        original_text_vocab_size = len(tokenizer)-num_new_tokens
-    else:
-        original_text_vocab_size = len(tokenizer)
-    # Image token 数量（原 ID 50305-58497）
-    original_image_vocab_size = model.showo.get_input_embeddings().num_embeddings - len(tokenizer)
-    original_total_vocab = original_text_vocab_size + original_image_vocab_size  # 58498
-    
-    # 新的参数
-    new_text_vocab_size = original_text_vocab_size + num_new_tokens  # 50305 + 25
-    new_total_vocab = original_total_vocab + num_new_tokens          # 58498 + 25
-
-    # ------------------------------
-    # Step 1: 修改 Tokenizer 的词汇表
-    # ------------------------------
-
-    # 添加新 token 到 50305-50321 的位置
-    if not second_time:
-        num_new_tokens = tokenizer.add_tokens(new_tokens)
-    new_token_ids = tokenizer.convert_tokens_to_ids(new_tokens)
-    print("新 token ID:", new_token_ids)  # 应输出 50305-50329
-    sks_token_id = tokenizer.convert_tokens_to_ids(sks_token)
-    print("sks_token_id:", sks_token_id)  # 应输出 50305
-    
-    # ------------------------------
-    # Step 2: 调整模型的权重
-    # ------------------------------
-    embed_dim = model.showo.get_input_embeddings().weight.shape[1] 
-    with torch.no_grad():
-        # 获取嵌入层权重
-        embeddings = model.showo.get_input_embeddings().weight.data
-        
-        # 扩展嵌入层（58498 -> 58522）
-        model.showo.resize_token_embeddings(new_total_vocab)
-        # new_embeddings = model.showo.get_input_embeddings().weight.data
-
-        # 将原 Image Token 权重后移 17 位
-        original_image_weights = embeddings[original_text_vocab_size:original_total_vocab].clone()
-        model.showo.get_input_embeddings().weight.data[new_text_vocab_size:new_total_vocab] = original_image_weights
-        print(original_text_vocab_size,original_total_vocab,new_text_vocab_size,new_total_vocab)
-        if os.path.exists(ckpt_embed_path):
-            ckpt_embed_weight = torch.load(ckpt_embed_path)
-            model.showo.get_input_embeddings().weight.data[original_text_vocab_size:original_text_vocab_size + 1 + nums_total_token_i] = ckpt_embed_weight.to(model.showo.get_input_embeddings().weight.device)
-        elif need_init and get_concept_info(concept)[2] == "human" and nums_new_token_i_stage_2 > 0:
-            model.showo.get_input_embeddings().weight.data[original_text_vocab_size + 1 + nums_new_token_i_stage_1:new_text_vocab_size] = face_embed_init(args, concept, nums_new_token_i_stage_2).to(model.showo.get_input_embeddings().weight.device)
-        else:
-            #
-            #
-            #
-            # raise ValueError("Embedding weights do not exist!")
-            new_embed_weights = Parameter(torch.randn(num_new_tokens, embed_dim, 
-                                           dtype=model.showo.get_input_embeddings().weight.dtype,
-                                           device=model.showo.get_input_embeddings().weight.device))
-            # 保持与原模型相同的初始化范围（通常为均匀分布或正态分布）
-            nn.init.normal_(new_embed_weights, mean=0.0, std=0.02)
-            model.showo.get_input_embeddings().weight.data[original_text_vocab_size:new_text_vocab_size] = new_embed_weights
-        
-
-        # 处理 lm_head（假设与嵌入层共享权重）
-        if model.showo.lm_head.weight.data.shape[0] == new_total_vocab:
-            # 扩展 lm_head 权重
-            lm_head = model.showo.lm_head
-            new_lm_head = torch.nn.Linear(
-                lm_head.in_features, 
-                new_total_vocab, 
-                bias=hasattr(lm_head, 'bias')
-            )
-            new_lm_head.weight.data = lm_head.weight.data.clone()
-            new_lm_head.weight.data[new_text_vocab_size:new_total_vocab] = lm_head.weight.data[original_text_vocab_size:original_total_vocab]
-
-            if os.path.exists(ckpt_lm_head_weight_path):
-                ckpt_lm_head_weight = torch.load(ckpt_lm_head_weight_path)
-                new_lm_head.weight.data[original_text_vocab_size:original_text_vocab_size + 1 + nums_total_token_i] = ckpt_lm_head_weight.to(new_lm_head.weight.device)
-            else:
-                # raise ValueError("lm_head weights do not exist!")
-                # 
-                # 
-                # 
-                print(f"警告: {ckpt_lm_head_weight_path} 不存在，使用随机初始化")
-                # 只随机初始化新增部分，而不是整个weight
-                new_lm_head.weight.data[original_text_vocab_size:new_text_vocab_size] = torch.randn(
-                    new_text_vocab_size - original_text_vocab_size, 
-                    embed_dim,
-                    dtype=model.showo.lm_head.weight.dtype,
-                    device=model.showo.lm_head.weight.device
-                )
-                nn.init.normal_(new_lm_head.weight.data[original_text_vocab_size:new_text_vocab_size], 
-                                mean=0.0, std=0.02)
-                # model.showo.lm_head.weight.data[original_text_vocab_size:new_text_vocab_size] = new_lm_head.weight
-        
-
-            if hasattr(lm_head, 'bias'):
-                new_lm_head.bias.data = lm_head.bias.data.clone()
-                new_lm_head.bias.data[new_text_vocab_size:new_total_vocab] = lm_head.bias.data[original_text_vocab_size:original_total_vocab]
-                
-                if os.path.exists(ckpt_lm_head_bias_path):
-                    ckpt_lm_head_bias = torch.load(ckpt_lm_head_bias_path)
-                    new_lm_head.bias.data[original_text_vocab_size:original_text_vocab_size + 1 + nums_total_token_i] = ckpt_lm_head_bias.to(new_lm_head.weight.device)
-                else:
-                    # raise ValueError("lm_head bias do not exist!")   
-                    # 
-                    # 
-                    # 
-                    # 
-                    print(f"警告: {ckpt_lm_head_bias_path} 不存在，使用随机初始化")
-                    # 只初始化新增部分的偏置
-                    new_lm_head.bias.data[original_text_vocab_size:new_text_vocab_size] = torch.zeros(
-                        new_text_vocab_size - original_text_vocab_size,
-                        dtype=model.showo.lm_head.bias.dtype,
-                        device=model.showo.lm_head.bias.device
-                    )
-       
-                         
-            model.showo.lm_head = new_lm_head
-        else:
-            raise ValueError("lm_head weights do not match the input embeddings!")
-
-    index_no_updates = torch.ones((new_total_vocab,), dtype=torch.bool)
-    index_no_updates[new_token_ids] = False
-    adj_token_ids = tokenizer.convert_tokens_to_ids(adj_tokens) # shape: [16]
-    
-    
-    # ------------------------------
-    # 验证
-    # ------------------------------
-    # 检查新 token 的 ID
-    print("新增文本 token ID:", [tokenizer.convert_tokens_to_ids(t) for t in new_tokens])  # 应输出 50305-50321
-
-    # 检查一个原 Image Token 的新 ID
-    sample_image_token = tokenizer.convert_ids_to_tokens(original_text_vocab_size)  # 原 ID 50305
-    print(sample_image_token)
-    print(f"Concept Token '{sample_image_token}' 的新 ID:", tokenizer.convert_tokens_to_ids(sample_image_token))  # 应输出 50322
-
-    # 检查嵌入层形状
-    print("嵌入层大小:", model.showo.get_input_embeddings().weight.shape)  # 应显示 torch.Size([58515, 2048])
-
-    # 检查 index_no_updates 中 True 的位置和数量，True 应该是 new token ids
-    print("index_no_updates 中 False 的位置:", torch.nonzero(~index_no_updates).squeeze())  # 应输出 50305-50321
-    print("index_no_updates 中 True 的数量:", torch.sum(index_no_updates))  # 应输出 58498
-
-    with torch.no_grad():
-        orig_embeds = model.showo.get_input_embeddings().weight.data.clone()
-        orig_lm_head_weight = model.showo.lm_head.weight.data.clone()
-        orig_lm_head_bias = model.showo.lm_head.bias.data.clone()
-        
-    return tokenizer, model, orig_embeds, orig_lm_head_weight, orig_lm_head_bias, \
-           index_no_updates, new_total_vocab, new_token_ids, adj_token_ids, sks_token_id
-def check_param(model,args):
-    #need to modify
-    for name, param in model.named_parameters():
-        if "embed_tokens" in name or "lm_head" in name:
-            param.requires_grad = True
-        else:
+        # freeze all vision encoders
+        for name, param in model.named_parameters():
+            if name.startswith("vision_model") or name.startswith("aligner") or name.startswith("gen"): # choose whatever you like here
+                param.requires_grad = False
+        for name, param in vq_model.named_parameters():
             param.requires_grad = False
 
-    #statistic
-    trainable_params = []
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            trainable_params.append(param)
+        self.local_rank = local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        # # Reference model
+        self.deepspeed_enabled = train_args.deepspeed
+        if self.deepspeed_enabled:
+            self.model, self.optimizer, _, _ = deepspeed.initialize(
+                model=model,
+                optimizer=optimizer,
+                config_params='/mnt/public/gpfs-jd/data/lh/ex/showo_feat/ds_config.json',
+                model_parameters=filter(lambda p: p.requires_grad, model.parameters())
+            )
+            self.model.module.gradient_checkpointing_enable()
+        else:
+            self.model=model
+            self.optimizer=optimizer
+        self.num_generations = args.num_gen  # = G in the GRPO paper
+        self.group=int(self.num_generations/4)
+        self.num_generations=int(self.num_generations/self.group)
+        self.beta = train_args.beta
+        self._metrics = defaultdict(list)
+        self.model_accepts_loss_kwargs = False
+        self.dataset=dataset
+        self.args=args
+        self.config=config
+        self.vq_model=vq_model
+        self.uni_prompting=uni_prompting
+        self.tokenizer=tokenizer
+        self.beta=0
+        # if self.deepspeed_enabled:
+        #     from deepspeed import zero
+        #     self.model, _ = deepspeed.initialize(model=model, config_params=train_args.deepspeed)
+        #     self.ref_model, _ = deepspeed.initialize(model=self.ref_model, config_params=train_args.deepspeed, eval_mode=True)
 
-    #statistic
-    for names, p in model.named_parameters():
-        if p.requires_grad:
-            print(f"{names} requires_grad") # embed_token, lm_head会更新
+        # # Reward functions
+        # if not isinstance(reward_funcs, list):
+        #     reward_funcs = [reward_funcs]
+        # for i, reward_func in enumerate(reward_funcs):
+        #     if isinstance(reward_func, str) and 'hps' in reward_func:
+        #         reward_funcs[i] = HPSv2(args)
+        #     elif isinstance(reward_func, str) and 'git' in reward_func:
+        #         reward_funcs[i] = GIT(args)
+        #     elif isinstance(reward_func, str) and 'gdino' in reward_func:
+        #         reward_funcs[i] = GDino(args)
+        #     elif isinstance(reward_func, str) and 'orm' in reward_func:
+        #         reward_funcs[i] = ORM(args)
+        #     else:
+        #         reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
+        #             reward_func, num_labels=1, **model_init_kwargs
+        #         )
+        # self.reward_funcs = reward_funcs
 
-    # 统计所有可训练参数数量
-    trainable_params_num = sum(p.numel() for p in trainable_params)
-    print(f"Trainable parameters: {trainable_params_num}")
-    optimizer = torch.optim.AdamW(
-        trainable_params, # for optimize the embeddings and the head
-        lr=args.lr,
-        betas=(0.9, 0.999),
-        weight_decay=1e-3,
-        eps=1e-08,
-    )
-    return optimizer
-def test_showo(model,image_path):
-    pass
-def main(args, training_args, model_args):
-    # Get reward functions
-    reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
-    if training_args.deepspeed:
-        with open(training_args.deepspeed, "r") as f:
-            training_args.deepspeed = json.load(f)
-    #get initial model
-    config = OmegaConf.load(args.config_file)
-    tokenizer, uni_prompting, vq_model, model= setup_model(args, config)
-    # ref_tokenizer,_,_,ref_model=setup_model(args, config)
-    # test_showo(model,'/home/daigaole/code/ex/dataset/unictokens_data/black_512x512.png')
-    #make filepath to save the result
-    data_root = args.data_root
-    concept = args.concept
-    save_path = os.path.join("saves", concept, args.task_name)
-    os.makedirs(save_path, exist_ok=True)
+        # # Reward processing class
+        # if reward_processing_classes is None:
+        #     reward_processing_classes = [None] * len(reward_funcs)
+        # elif not isinstance(reward_processing_classes, list):
+        #     reward_processing_classes = [reward_processing_classes]
+        # else:
+        #     if len(reward_processing_classes) != len(reward_funcs):
+        #         raise ValueError("The number of reward processing classes must match the number of reward functions.")
 
-    #set up training arch
-    tokenizer, model, orig_embeds, orig_lm_head_weight, \
-    orig_lm_head_bias, index_no_updates, new_total_vocab, new_token_ids, adj_token_ids, sks_token_id \
-    = update_tokens_load_from_pretrained(args, concept, tokenizer, model, 
-                                         args.pre_trained_ckpt_name, 
-                                         args.epoch_to_load,
-                                         nums_new_token_i_stage_1=args.nums_new_token_i_stage_1,
-                                         nums_new_token_i_stage_2=args.nums_new_token_i_stage_2,
-                                         need_init=True
-                                         )
-    # ref_tokenizer, ref_model,_,_, \
-    # _,_,_,_,_,_ \
-    # = update_tokens_load_from_pretrained(args, concept, ref_tokenizer, ref_model, 
-    #                                      args.pre_trained_ckpt_name, 
-    #                                      args.epoch_to_load,
-    #                                      nums_new_token_i_stage_1=args.nums_new_token_i_stage_1,
-    #                                      nums_new_token_i_stage_2=args.nums_new_token_i_stage_2,
-    #                                      need_init=True
-    #                                      )
-    config.new_total_vocab=new_total_vocab
-    # set up parameters
-    vq_model.requires_grad_ = False
-    vq_model.eval()
-    model.train()
-    optimizer=check_param(model,args)
-
-    # set up dataset
-    if args.t2i_data:
-        load_caption_training_path = os.path.join("saves", concept, args.pre_trained_ckpt_name, "captions.json")
-        t2i_dataloader = get_personalized_t2i_dataloader(data_root, concept, tokenizer, args.image_size, 
-                                                         batch_size=args.t2i_bsz, num_workers=0, max_length=128, 
-                                                         nums_new_token_i=args.nums_new_token_i_stage_1 + args.nums_new_token_i_stage_2,
-                                                         more_data = args.more_t2i_data, inited = True, system_prompt_t2i = False, 
-                                                         caption_training = args.caption_training, load_caption_training_path = load_caption_training_path,
-                                                         less_t2i_data=args.less_t2i_data,)
-    if args.mmu_data:
-        mmu_dataloader = get_personalized_mmu_dataloader(data_root, concept, tokenizer, args.image_size, 
-                                                         batch_size=args.mmu_bsz, num_workers=0, max_length=128, 
-                                                         new_tokens=True, stage=1, 
-                                                         nums_new_token_i_stage_1=args.nums_new_token_i_stage_1,
-                                                         nums_new_token_i_stage_2=args.nums_new_token_i_stage_2,)
-
-    if args.t2i_data and args.mmu_data:
-        iterables = {
-            'mmu_flow': mmu_dataloader,
-            't2i_flow': t2i_dataloader
-        }
-        combined_dataloader = CombinedLoader(iterables, mode="max_size_cycle")
-    elif args.t2i_data:
-        iterables = {
-            't2i_flow': t2i_dataloader
-        }
-        combined_dataloader = CombinedLoader(iterables, mode="max_size_cycle")
-    elif args.mmu_data:
-        iterables = {
-            'mmu_flow': mmu_dataloader
-        }
-        combined_dataloader = CombinedLoader(iterables, mode="max_size_cycle")
-    else:
-        raise ValueError("No dataset loaded")
-    # finish setting dataset
-    combined_dataloader_list = list(combined_dataloader)
-    
+        # for i, (reward_processing_class, reward_func) in enumerate(zip(reward_processing_classes, reward_funcs)):
+        #     if isinstance(reward_func, PreTrainedModel):
+        #         if reward_processing_class is None:
+        #             reward_processing_class = AutoTokenizer.from_pretrained(reward_func.config._name_or_path)
+        #         if reward_processing_class.pad_token_id is None:
+        #             reward_processing_class.pad_token = reward_processing_class.eos_token
+        #         # The reward model computes the reward for the latest non-padded token in the input sequence.
+        #         # So it's important to set the pad token ID to the padding token ID of the processing class.
+        #         reward_func.config.pad_token_id = reward_processing_class.pad_token_id
+        #         reward_processing_classes[i] = reward_processing_class
+        # self.reward_processing_classes = reward_processing_classes
 
 
-
-    trainer_cls = unic_grpo
-    print("using: ", trainer_cls)
-
-    # Initialize the GRPO trainer
-    trainer = trainer_cls(
-        model=model,
-        # ref_model=ref_model,
-        reward_funcs=reward_funcs,
-        args=args,
-        train_args=training_args,
-        config=config,
-        dataset=combined_dataloader_list,
-        vq_model=vq_model,
-        uni_prompting=uni_prompting,
-        optimizer=optimizer,
-        tokenizer=tokenizer,
-        # ref_tokenizer=ref_tokenizer,
-        # eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-        peft_config=get_peft_config(model_args),
-        attn_implementation=model_args.attn_implementation,
-    )
-
-    # Train and push the model to the Hub
-    trainer.train()
-
-    # Save and push to hub
-    trainer.save_model(training_args.output_dir)
-    if training_args.push_to_hub:
-        trainer.push_to_hub(dataset_name=script_args.dataset_name)
+        
+        # if self.beta != 0:
+        #     if self.is_deepspeed_enabled:
+        #         self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
+        #     else:
+        #         self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
+        # else:
+        #     self.ref_model = None
 
 
+    def _get_per_token_logps(self, model, input_embeds, text_ids, img_ids, attention_mask):
+        def _get_per_token_logps_part(logits, input_ids):
+            logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
+            input_ids = input_ids[:, 1:]  # (B, L-1), exclude the first input ID since we don't have logits for it
+            # Compute the log probabilities for the input tokens. Use a loop to reduce memory peak.
+            per_token_logps = []
+
+            for logits_row, input_ids_row in zip(logits, input_ids):
+                log_probs = logits_row.log_softmax(dim=-1)
+                token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
+                per_token_logps.append(token_log_prob)
+            return torch.stack(per_token_logps)
+        # here, we only compute either text or image loss, so ids of other one could be omitted
+        if img_ids is not None:
+            # compute logits for image tokens
+            hidden_states = model.language_model(inputs_embeds=input_embeds, attention_mask=attention_mask, output_hidden_states=True).hidden_states  # (B, L, V)
+            last_hidden_states = hidden_states[-1]
+            # (text input id, image start token, image input id)
+            # text_ids: text input id + image start token
+            # img_ids: img_id (image token)
+            image_logits = model.gen_head(last_hidden_states[:, -(img_ids.size(1)+1):, :]) # image prediction
+            
+            img_input_ids = torch.cat([img_ids.new_zeros(img_ids.size(0), 1), img_ids], dim=1) # cat a random one here, since it is not used in the loss calculation
+            per_token_logps_img = _get_per_token_logps_part(image_logits, img_input_ids) # only calculate image loss
+            return torch.cat([
+                per_token_logps_img.new_zeros(
+                    (per_token_logps_img.size(0), input_embeds.size(1) - per_token_logps_img.size(1) - 1)
+                ), # the return length should be the input length minus 1 (the last token does not need predict)
+                per_token_logps_img
+            ], 
+            dim=1)
+        else: # only calculate text ids
+            hidden_states = model.language_model(inputs_embeds=input_embeds, attention_mask=attention_mask, output_hidden_states=True).hidden_states  # (B, L, V)
+            last_hidden_states = hidden_states[-1]
+            text_logits = model.language_model.lm_head(last_hidden_states) 
+            per_token_logps_text = _get_per_token_logps_part(text_logits, text_ids) 
+            return per_token_logps_text
+
+    def _prepare_inputs(self, inputs):
+        return inputs
+
+    def train(self,return_outputs=False, num_items_in_batch=None):
+        if return_outputs:
+            raise ValueError("The GRPOTrainer does not support returning outputs")
+        # other setting
+        self.model.config.mask_token_id = self.model.showo.get_input_embeddings().num_embeddings - 1
+        self.model.mask_token_id = self.model.showo.get_input_embeddings().num_embeddings - 1
+        # self.ref_model.config.mask_token_id = self.ref_model.showo.get_input_embeddings().num_embeddings - 1
+        # self.ref_model.mask_token_id = self.ref_model.showo.get_input_embeddings().num_embeddings - 1
+        mask_schedule = get_mask_chedule(self.config.training.get("mask_schedule", "cosine"))
+        mask_id = self.model.mask_token_id
+        mask_dtype = self.model.showo.get_input_embeddings().weight.dtype
+        self.model.output_size = self.config.new_total_vocab
+        # self.ref_model.output_size = self.config.new_total_vocab
+        signal=False
+        for epoch in range(self.args.epoch):
+            print(f"Epoch {epoch+1}")
+            loss_list = []
+            if self.args.t2i_data:
+                loss_t2i_list = []
+            if self.args.mmu_data:
+                loss_mmu_list = []
+            counter=0
+            for batch, batch_idx, dataloader_idx in tqdm(self.dataset):
+            # for _ in range(100):
+                torch.cuda.empty_cache()
+                batch_size_t2i = batch["t2i_flow"]["images"].shape[0]
+                # batch_size_t2i=1
+                #realize t2i inference
+                self.config.model.showo.llm_vocab_size = len(self.tokenizer) - 10
+                self.config.generation_timesteps = 50
+                self.config.guidance_scale = 5
+
+                nums_new_token_i_stage_1 = self.args.nums_new_token_i_stage_1
+                nums_new_token_i_stage_2 = self.args.nums_new_token_i_stage_2
+                new_tokens_stage_1 = [f"<token_{i}>" for i in range(nums_new_token_i_stage_1)]
+                new_tokens_stage_2 = [f"<token_{i}>" for i in range(nums_new_token_i_stage_1, nums_new_token_i_stage_1 + nums_new_token_i_stage_2)]
+
+                # mti_ref=self.ref_model.config.mask_token_id
+                # self.ref_model.config.mask_token_id = self.ref_model.showo.get_input_embeddings().num_embeddings - 1
+                # mask_token_id = self.ref_model.showo.get_input_embeddings().num_embeddings - 1
+                # image_tokens_infer = torch.ones((batch_size_t2i, self.config.model.showo.num_vq_tokens),
+                #                         dtype=torch.long, device=self.args.device) * mask_token_id
+                global_logits=[]
+                global_id=[]
+                for group_id in range(self.group):
+                    mti=self.model.config.mask_token_id
+                    self.model.config.mask_token_id = self.model.showo.get_input_embeddings().num_embeddings - 1
+                    mask_token_id = self.model.showo.get_input_embeddings().num_embeddings - 1
+                    image_tokens_infer = torch.ones((batch_size_t2i, self.config.model.showo.num_vq_tokens),
+                                            dtype=torch.long, device=self.args.device) * mask_token_id
+                    
+                    
+                    save_dir='/mnt/public/gpfs-jd/data/lh/ex/showo_feat/tmp_result/'
+                    condition='A photo of '
+                    for token in new_tokens_stage_1:
+                        condition+=token
+                    for token in new_tokens_stage_2:
+                        condition+=token
+                    condition+='<adrien_brody>.\n'
+                    conditions = [condition] * batch_size_t2i
+                    
+                    input_ids_infer, _ = self.uni_prompting((conditions, image_tokens_infer), 't2i_gen')   # [1, 387]
+                    if self.config.guidance_scale > 0:
+                        uncond_input_ids, _ = self.uni_prompting(([''] * batch_size_t2i, image_tokens_infer), 't2i_gen')
+                    # [1, 387], == [PAD] * 126 + <|t2i|> + <|endoftext|> + <|endoftext|> + <|soi|> + [MASK] * 256 + <|eoi|> ## no prompt
+                        attention_mask1 = create_attention_mask_predict_next(torch.cat([input_ids_infer, uncond_input_ids], dim=0),    # [2, 387]
+                                                                            pad_id=int(self.uni_prompting.sptids_dict['<|pad|>']),
+                                                                            soi_id=int(self.uni_prompting.sptids_dict['<|soi|>']),
+                                                                            eoi_id=int(self.uni_prompting.sptids_dict['<|eoi|>']),
+                                                                            rm_pad_in_image=True)
+                    else:
+                        attention_mask1 = create_attention_mask_predict_next(input_ids_infer,
+                                                                            pad_id=int(self.uni_prompting.sptids_dict['<|pad|>']),
+                                                                            soi_id=int(self.uni_prompting.sptids_dict['<|soi|>']),
+                                                                            eoi_id=int(self.uni_prompting.sptids_dict['<|eoi|>']),
+                                                                            rm_pad_in_image=True)
+                        uncond_input_ids = None
+                    if self.config.get("mask_schedule", None) is not None:
+                        schedule = self.config.mask_schedule.schedule
+                        arg = self.config.mask_schedule.get("params", {})
+                        mask_schedule = get_mask_chedule(schedule, **arg)
+                    else:
+                        mask_schedule = get_mask_chedule(self.config.training.get("mask_schedule", "cosine"))
+                    print(self.num_generations,self.local_rank,group_id)
+
+                    # input_ids_infer=input_ids_infer.repeat_interleave(self.num_generations,dim=0)
+                    # attention_mask1=attention_mask1.repeat_interleave(self.num_generations,dim=0)
+                    # uncond_input_ids=uncond_input_ids.repeat_interleave(self.num_generations,dim=0)
+
+                    # print('model-basemodel')
+                    # for (n1, p1), (n2, p2) in zip(self.model.named_parameters(), self.basemodel.named_parameters()):
+                    #     if torch.allclose(p1, p2)!=True:
+                    #         print(f"parameter {n1} is not equal")
+                    # print('refmodel-basemodel')
+                    # for (n1, p1), (n2, p2) in zip(self.ref_model.named_parameters(), self.basemodel.named_parameters()):
+                    #     if torch.allclose(p1, p2)!=True:
+                    #         print(f"parameter {n1} is not equal")
+                    
+                    # with torch.no_grad():
+                    gen_token_ids,logits = self.model.t2i_generate(
+                        input_ids=input_ids_infer,
+                        uncond_input_ids=uncond_input_ids,
+                        attention_mask=attention_mask1,
+                        guidance_scale=self.config.guidance_scale,
+                        temperature=self.config.training.get("generation_temperature", 1.0),
+                        timesteps=self.config.generation_timesteps,
+                        noise_schedule=mask_schedule,
+                        noise_type=self.config.training.get("noise_type", "mask"),
+                        seq_len=self.config.model.showo.num_vq_tokens,
+                        uni_prompting=self.uni_prompting,
+                        config=self.config,
+                        return_logits=True,
+                    )
+                    local_gen_token_ids = gen_token_ids#[self.local_rank::self.world_size]
+                    local_logits = logits#[self.local_rank::self.world_size]
+                    global_id.append(local_gen_token_ids)
+                    global_logits.append(local_logits)
+
+                    del input_ids_infer, attention_mask1, uncond_input_ids
+                    del gen_token_ids, logits
+                    torch.cuda.empty_cache()
+                gen_token_ids=torch.cat(global_id)
+                logits=torch.cat(global_logits)
+                del global_id,global_logits
+                torch.cuda.empty_cache()
+                gen_token_ids = torch.clamp(gen_token_ids, max=self.config.model.showo.codebook_size - 1, min=0)
+                images = self.vq_model.decode_code(gen_token_ids)
+                images = torch.clamp((images + 1.0) / 2.0, min=0.0, max=1.0)
+                images *= 255.0
+                images = images.permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
+                pil_images = [Image.fromarray(image) for image in images]
+                for j in range(len(pil_images)):
+                    gen_image = pil_images[j]
+                    gen_image.save(os.path.join(save_dir, f"part_{self.world_size*j+self.local_rank}.png"))
+                    # gen_image.save(os.path.join('/mnt/public/gpfs-jd/data/lh/ex/showo_feat/ref_image/adrien_brody',f"{counter}.png"))
+                    # counter+=1
+                    del gen_image
 
 
 
-# def print_args(args_obj, prefix=""):
-#     print(f"{prefix}{type(args_obj).__name__}")
-#     for key in vars(args_obj):
-#         value = getattr(args_obj, key)
-#         if isinstance(value, (GRPOScriptArguments, GRPOConfig, ModelConfig)):
-#             print(f"{prefix}{key}:")
-#             print_args(value, prefix)
-#         elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], (GRPOScriptArguments, GRPOConfig, ModelConfig)):
-#             print(f"{prefix} {key} ({len(value)}):")
-#             for i, item in enumerate(value):
-#                 print(f"{prefix}{i}:")
-#                 print_args(item, prefix)
-#         else:
-#             print(f"{prefix}{key}: {value}")
-#     print(f"{prefix}")
+                # if isinstance(images, np.ndarray):
+                #     images = torch.from_numpy(images).to(self.args.device)
+                # if not images.is_contiguous():
+                #     images = images.contiguous()
+                # all_images_list = [torch.zeros_like(images) for _ in range(self.world_size)]
+                # dist.all_gather(all_images_list, images)
+                # print('all',torch.cat(all_images_list, dim=0).shape)
+                # all_images = torch.cat(all_images_list, dim=0)
 
-import sys
-import json
-if __name__ == "__main__":
-    print(sys.executable)
-    parser = TrlParser((GRPOScriptArguments, GRPOConfig, ModelConfig))
-    script_args, training_args, model_args = parser.parse_args_and_config()
-    main(script_args, training_args, model_args)
+                # all_logits_list = [torch.zeros_like(logits) for _ in range(self.world_size)]
+                # dist.all_gather(all_logits_list, logits)
+                # all_logits = torch.cat(all_logits_list, dim=0)
+
+                # all_images = torch.clamp((all_images + 1.0) / 2.0, min=0.0, max=1.0)
+                # all_images *= 255.0
+                # all_images = all_images.permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
+                # print('all_numpy',all_images.shape)
+                # if self.local_rank == 0:
+                #     pil_images = [Image.fromarray(image) for image in all_images]
+                #     print('len',len(pil_images))
+                #     # tmp=counter
+                #     for j in range(len(pil_images)):
+                #         gen_image = pil_images[j]
+                #         gen_image.save(os.path.join(save_dir, f"part_{j}.png"))
+                #         # gen_image.save(os.path.join('/mnt/public/gpfs-jd/data/lh/ex/showo_feat/ref_image/adrien_brody',f"{counter}.png"))
+                #         # counter+=1
+                #         del gen_image
+                #     # counter=tmp
+                #     # for l in global_logits:
+                #     #     torch.save(l,os.path.join('/mnt/public/gpfs-jd/data/lh/ex/showo_feat/ref_image/adrien_brody',f"{counter}.pt"))
+                #     #     counter+=1
+                #     del pil_images, images
+                #     torch.cuda.empty_cache()
+
+                self.model.config.mask_token_id=mti
+                # logits=all_logits
+                # del all_logits,all_images
+                # continue
+
+                # #test token:
+                # ids=gen_token_ids[0]
+                # ids1=gen_token_ids[1]
+                # image_path='/mnt/public/gpfs-jd/data/lh/ex/showo_feat/tmp_result/0_ref.png'
+                # image_ori = Image.open(image_path).convert("RGB")
+
+                # image = image_transform(image_ori, resolution = self.config.dataset.params.resolution).to(self.args.device)
+                # image = image.unsqueeze(0)
+                # image_tokens_mmu = self.vq_model.get_code(image)
+                # image_tokens = image_tokens_mmu + len(self.uni_prompting.text_tokenizer)
+
+                # print('ids_0',ids,ids.shape)
+                # print('ids_1',ids1,ids1.shape)
+                # print('input ids',image_tokens,image_tokens.shape)
+                # #understand test
+                # top_k=1
+                # question='please score the handsomeness of the person in the image using a number ranging from 0 to 10 and output the reasons.\n'
+                # input_ids = self.uni_prompting.text_tokenizer(['USER: ' + question + ' ASSISTANT:'])['input_ids']
+                # input_ids = torch.tensor(input_ids).to(self.args.device)
+
+                # input_ids = torch.cat([
+                #     (torch.ones(input_ids.shape[0], 1) * self.uni_prompting.sptids_dict['<|mmu|>']).to(self.args.device),
+                #     (torch.ones(input_ids.shape[0], 1) * self.uni_prompting.sptids_dict['<|soi|>']).to(self.args.device),
+                #     image_tokens,
+                #     (torch.ones(input_ids.shape[0], 1) * self.uni_prompting.sptids_dict['<|eoi|>']).to(self.args.device),
+                #     (torch.ones(input_ids.shape[0], 1) * self.uni_prompting.sptids_dict['<|sot|>']).to(self.args.device),
+                #     input_ids
+                # ], dim=1).long()
+                # print('processed',input_ids,input_ids.shape)
+                # attention_mask = create_attention_mask_for_mmu(input_ids.to(self.args.device),
+                #                                                 eoi_id=int(self.uni_prompting.sptids_dict['<|eoi|>']))
+
+                # cont_toks_list = self.ref_model.mmu_generate(input_ids, attention_mask=attention_mask,
+                #                             max_new_tokens=100, top_k=top_k,
+                #                             eot_token=self.uni_prompting.sptids_dict['<|eot|>'])
+
+                # cont_toks_list = torch.stack(cont_toks_list).squeeze()[None]
+
+                # text = self.uni_prompting.text_tokenizer.batch_decode(cont_toks_list, skip_special_tokens=True)[0].strip()
+                # print(text)
+                
+
+                
+                # load save logit
+                load_dir='/mnt/public/gpfs-jd/data/lh/ex/showo_feat/ref_image/adrien_brody'
+                save_logits=[]
+                for j in range(self.group):
+                    random_numbers = random.sample(range(100), 30)
+                    tmp_list=[]
+                    for idx in random_numbers:
+                        l=torch.load(os.path.join(load_dir,f"{idx}.pt"))
+                        # l=torch.softmax(l,dim=-1)
+                        tmp_list.append(l)
+                    tmp_tensor=torch.stack(tmp_list).mean(dim=0)
+                    save_logits.append(tmp_tensor)
+                ref_per_token_logps=torch.cat(save_logits).to(self.args.device)
+                # if not signal:
+                #     self.save_logits=logits
+                #     signal=True
+                # ref_per_token_logps=self.save_logits
+                    
+                
+                #calculate the rewards
+                # rewards=torch.zeros(self.num_generations*batch_size_t2i).to(self.args.device)
+                reward_list=[]
+                
+                # question='Please output a score ranging from 0 to 10 to represent the correctness of the following question:\n'+'Is '
+                # question='How much do you think that '
+                # for token in new_tokens_stage_1:
+                #     question+=token
+                # for token in new_tokens_stage_2:
+                #     question+=token
+                # question+='<adrien_brody> in the image?\n'
+                # question+='Please use a score ranging from 0 to 10 to represent.\n'
+                # # question+='Only a score is needed,please don\'t output yes or no.\n'
+                image_path='/mnt/public/gpfs-jd/data/lh/ex/showo_feat/tmp_result/'
+                path_list=[os.path.join(image_path,f"part_{self.world_size*j+self.local_rank}.png") for j in range(self.group)]
+                # for path in path_list:
+                #     image_ori = Image.open(path).convert("RGB")
+                #     image = image_transform(image_ori, resolution = self.config.dataset.params.resolution).to(self.args.device)
+                #     image = image.unsqueeze(0)
+                #     image_tokens_mmu = self.vq_model.get_code(image)
+                #     image_tokens = image_tokens_mmu + len(self.uni_prompting.text_tokenizer)
+                #     top_k=1
+                    
+                #     input_ids = self.uni_prompting.text_tokenizer(['USER: ' + question + ' ASSISTANT:'])['input_ids']
+                #     input_ids = torch.tensor(input_ids).to(self.args.device)
+
+                #     input_ids = torch.cat([
+                #         (torch.ones(input_ids.shape[0], 1) * self.uni_prompting.sptids_dict['<|mmu|>']).to(self.args.device),
+                #         (torch.ones(input_ids.shape[0], 1) * self.uni_prompting.sptids_dict['<|soi|>']).to(self.args.device),
+                #         image_tokens,
+                #         (torch.ones(input_ids.shape[0], 1) * self.uni_prompting.sptids_dict['<|eoi|>']).to(self.args.device),
+                #         (torch.ones(input_ids.shape[0], 1) * self.uni_prompting.sptids_dict['<|sot|>']).to(self.args.device),
+                #         input_ids
+                #     ], dim=1).long()
+                #     # print('processed',input_ids,input_ids.shape)
+                #     attention_mask = create_attention_mask_for_mmu(input_ids.to(self.args.device),
+                #                                                     eoi_id=int(self.uni_prompting.sptids_dict['<|eoi|>']))
+
+                #     cont_toks_list = self.ref_model.mmu_generate(input_ids, attention_mask=attention_mask,
+                #                                 max_new_tokens=100, top_k=top_k,
+                #                                 eot_token=self.uni_prompting.sptids_dict['<|eot|>'])
+
+                #     cont_toks_list = torch.stack(cont_toks_list).squeeze()[None]
+
+                #     text = self.uni_prompting.text_tokenizer.batch_decode(cont_toks_list, skip_special_tokens=True)[0].strip()
+                #     print(text)
+                #     text=text.lower()
+                #     if 'yes' in text:
+                #         reward_list.append(1)
+                #     elif 'no' in text:
+                #         reward_list.append(0)
+                #     else:
+                #         reward_list.append(0.5)
+                # rewards1=torch.tensor(reward_list).float().reshape(self.group*self.num_generations*batch_size_t2i).to(self.args.device)
+
+
+                #clip reward
+                reward2_list=[]
+                clip_model=SHOWO_P_CLIPEvaluator("cuda:0")
+                for path in path_list:
+                    clip_model.save_dir=path
+                    sim=clip_model.evaluate_concept('adrien_brody','',0)
+                    print('similarity',path,sim)
+                    reward2_list.append(sim)
+                # print('score',sum(reward2_list)/len(reward2_list))
+                rewards2=torch.tensor(reward2_list).float().reshape(self.group).to(self.args.device)
+
+                #gpt-4o reward
+                # reward3_list=[]
+                # prompt='How much do you think the man in the first image appears in the second image?\nPlease use a number ranging from 0 to 1 to represent.\nPlease only output a number.\n'
+                # ref_path='/mnt/public/gpfs-jd/data/lh/ex/dataset/unictokens_data/concept/train/adrien_brody/0.png'
+                # for path in path_list:
+                #     answer=chat_with_images_gpt(prompt,[ref_path,path])
+                #     answer=extract_single_number(answer)
+                #     print(path,'gpt score:',answer)
+                #     reward3_list.append(answer)
+                # rewards3=torch.tensor(reward3_list).float().reshape(self.num_generations*batch_size_t2i*self.group).to(self.args.device)
+
+                # rewards=rewards2*0.2+rewards3*0.8
+                
+                rewards=rewards2
+
+
+
+                
+                all_rewards_list = [torch.zeros_like(rewards) for _ in range(self.world_size)]
+                dist.all_gather(all_rewards_list, rewards)
+                all_rewards = torch.cat(all_rewards_list, dim=0)
+                rewards=all_rewards
+
+                
+                per_token_logps=logits
+                # if self.local_rank==0:
+                #     print(per_token_logps.requires_grad)
+                # print(rewards,per_token_logps,ref_per_token_logps)
+
+
+                #grpo
+                mean_grouped_rewards = rewards.view(-1, self.num_generations*self.group).mean(dim=1)
+                std_grouped_rewards = rewards.view(-1, self.num_generations*self.group).std(dim=1)
+
+                # Normalize the rewards to compute the advantages
+                mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations*self.group, dim=0)
+                std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations*self.group, dim=0)
+                advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+                dist.broadcast(advantages, src=0)
+                # print(advantages)
+                advantages = advantages[self.local_rank::self.world_size]
+                # print(advantages)
+
+                self.model.train()
+                # torch.set_grad_enabled(True)
+                # per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1).unsqueeze(2)
+
+                per_token_logps=normalize_logits(per_token_logps)
+                ref_per_token_logps=normalize_logits(ref_per_token_logps)
+                log_ratio =per_token_logps - ref_per_token_logps
+                ratio = torch.exp(log_ratio)
+                
+                
+                per_token_loss= ratio* advantages.unsqueeze(1).unsqueeze(2)
+
+                per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+
+                if self.local_rank==0:
+                    print('mean of kl',per_token_kl.mean())
+                    print('mean of per_token_loss',per_token_loss.mean())
+
+                per_token_loss = -(per_token_loss - self.beta * per_token_kl)
+
+                # print("completion_mask shape:", completion_mask.shape)
+                completion_mask=torch.ones_like(per_token_loss)
+                loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
+
+                #log
+                if self.deepspeed_enabled:
+                    self.model.backward(loss)
+                    self.model.step()
+                else:
+                    loss.backward()
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                # if self.args.t2i_data and (epoch+1) % 10 == 0:
+                #     print('epoch',epoch+1,'loss',loss.item())
+
+                loss_tensor = torch.tensor([loss.item()], device=loss.device)
+                dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+                world_size = dist.get_world_size()
+                avg_loss = loss_tensor.item() / world_size
+                if dist.get_rank() == 0:
+                    loss_list.append(avg_loss)
+                    print(f"loss: {avg_loss:.4f}")
+
+                # for (n1, p1), (n2, p2) in zip(self.model.named_parameters(), self.ref_model.named_parameters()):
+                #     if torch.allclose(p1, p2)!=True:
+                #         print(f"parameter {n1} is not equal")
+                import gc
+                del gen_token_ids, logits, rewards, per_token_logps, ref_per_token_logps
+                gc.collect()
+                torch.cuda.empty_cache()
