@@ -11,6 +11,8 @@ import transformers
 import deepspeed
 from datasets import Dataset, IterableDataset
 from packaging import version
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from clip_eval import SHOWO_P_CLIPEvaluator
 from models import Showo, MAGVITv2, get_mask_chedule
@@ -18,6 +20,7 @@ from clip.model import build_model
 from training.prompting_utils import UniversalPrompting, create_attention_mask_predict_next, create_attention_mask_for_mmu
 from transformers.integrations import is_deepspeed_zero3_enabled 
 from gpttest import chat_with_images_gpt
+from torch.utils.checkpoint import checkpoint
 from transformers import (
 
     AutoModelForCausalLM,
@@ -77,6 +80,12 @@ def clone_model(model: torch.nn.Module) -> torch.nn.Module:
     new_model.to(next(model.parameters()).device)
     
     return new_model
+def normalize_logits(logits, eps=1e-8):
+    mean = logits.mean(dim=-1, keepdim=True)
+    std = logits.std(dim=-1, keepdim=True)
+    return (logits - mean) / (std + eps) 
+
+
 def extract_single_number(text):
     match = re.fullmatch(r'\s*-?\d+\.?\d*\s*', text.strip())
     if match:
@@ -109,14 +118,15 @@ class unic_grpo(Trainer):
         for name, param in vq_model.named_parameters():
             param.requires_grad = False
 
-
+        self.local_rank = local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         # # Reference model
         self.deepspeed_enabled = train_args.deepspeed
         if self.deepspeed_enabled:
             self.model, self.optimizer, _, _ = deepspeed.initialize(
                 model=model,
                 optimizer=optimizer,
-                config_params='/home/daigaole/code/ex/showo_feat/ds_config.json',
+                config_params='/mnt/public/gpfs-jd/data/lh/ex/showo_feat/ds_config.json',
                 model_parameters=filter(lambda p: p.requires_grad, model.parameters())
             )
             self.model.module.gradient_checkpointing_enable()
@@ -124,8 +134,8 @@ class unic_grpo(Trainer):
             self.model=model
             self.optimizer=optimizer
         self.num_generations = args.num_gen  # = G in the GRPO paper
-        self.group=self.num_generations
-        self.num_generations=int(self.num_generations/self.num_generations)
+        self.group=int(self.num_generations/4)
+        self.num_generations=int(self.num_generations/self.group)
         self.beta = train_args.beta
         self._metrics = defaultdict(list)
         self.model_accepts_loss_kwargs = False
@@ -135,7 +145,7 @@ class unic_grpo(Trainer):
         self.vq_model=vq_model
         self.uni_prompting=uni_prompting
         self.tokenizer=tokenizer
-        self.beta=0.01
+        self.beta=0
         # if self.deepspeed_enabled:
         #     from deepspeed import zero
         #     self.model, _ = deepspeed.initialize(model=model, config_params=train_args.deepspeed)
@@ -245,6 +255,7 @@ class unic_grpo(Trainer):
         mask_dtype = self.model.showo.get_input_embeddings().weight.dtype
         self.model.output_size = self.config.new_total_vocab
         # self.ref_model.output_size = self.config.new_total_vocab
+        signal=False
         for epoch in range(self.args.epoch):
             print(f"Epoch {epoch+1}")
             loss_list = []
@@ -252,9 +263,12 @@ class unic_grpo(Trainer):
                 loss_t2i_list = []
             if self.args.mmu_data:
                 loss_mmu_list = []
+            counter=0
             for batch, batch_idx, dataloader_idx in tqdm(self.dataset):
+            # for _ in range(100):
                 torch.cuda.empty_cache()
                 batch_size_t2i = batch["t2i_flow"]["images"].shape[0]
+                # batch_size_t2i=1
                 #realize t2i inference
                 self.config.model.showo.llm_vocab_size = len(self.tokenizer) - 10
                 self.config.generation_timesteps = 50
@@ -280,7 +294,7 @@ class unic_grpo(Trainer):
                                             dtype=torch.long, device=self.args.device) * mask_token_id
                     
                     
-                    save_dir='/home/daigaole/code/ex/showo_feat/tmp_result'
+                    save_dir='/mnt/public/gpfs-jd/data/lh/ex/showo_feat/tmp_result/'
                     condition='A photo of '
                     for token in new_tokens_stage_1:
                         condition+=token
@@ -311,10 +325,11 @@ class unic_grpo(Trainer):
                         mask_schedule = get_mask_chedule(schedule, **arg)
                     else:
                         mask_schedule = get_mask_chedule(self.config.training.get("mask_schedule", "cosine"))
-                    print(self.num_generations)
-                    input_ids_infer=input_ids_infer.repeat_interleave(self.num_generations,dim=0)
-                    attention_mask1=attention_mask1.repeat_interleave(self.num_generations,dim=0)
-                    uncond_input_ids=uncond_input_ids.repeat_interleave(self.num_generations,dim=0)
+                    print(self.num_generations,self.local_rank,group_id)
+
+                    # input_ids_infer=input_ids_infer.repeat_interleave(self.num_generations,dim=0)
+                    # attention_mask1=attention_mask1.repeat_interleave(self.num_generations,dim=0)
+                    # uncond_input_ids=uncond_input_ids.repeat_interleave(self.num_generations,dim=0)
 
                     # print('model-basemodel')
                     # for (n1, p1), (n2, p2) in zip(self.model.named_parameters(), self.basemodel.named_parameters()):
@@ -324,7 +339,8 @@ class unic_grpo(Trainer):
                     # for (n1, p1), (n2, p2) in zip(self.ref_model.named_parameters(), self.basemodel.named_parameters()):
                     #     if torch.allclose(p1, p2)!=True:
                     #         print(f"parameter {n1} is not equal")
-
+                    
+                    # with torch.no_grad():
                     gen_token_ids,logits = self.model.t2i_generate(
                         input_ids=input_ids_infer,
                         uncond_input_ids=uncond_input_ids,
@@ -339,16 +355,19 @@ class unic_grpo(Trainer):
                         config=self.config,
                         return_logits=True,
                     )
-                    global_id.append(gen_token_ids)
-                    global_logits.append(logits)
+                    local_gen_token_ids = gen_token_ids#[self.local_rank::self.world_size]
+                    local_logits = logits#[self.local_rank::self.world_size]
+                    global_id.append(local_gen_token_ids)
+                    global_logits.append(local_logits)
+
                     del input_ids_infer, attention_mask1, uncond_input_ids
                     del gen_token_ids, logits
                     torch.cuda.empty_cache()
                 gen_token_ids=torch.cat(global_id)
                 logits=torch.cat(global_logits)
                 del global_id,global_logits
+                torch.cuda.empty_cache()
                 gen_token_ids = torch.clamp(gen_token_ids, max=self.config.model.showo.codebook_size - 1, min=0)
-                completion_mask=torch.ones_like(gen_token_ids)
                 images = self.vq_model.decode_code(gen_token_ids)
                 images = torch.clamp((images + 1.0) / 2.0, min=0.0, max=1.0)
                 images *= 255.0
@@ -356,17 +375,56 @@ class unic_grpo(Trainer):
                 pil_images = [Image.fromarray(image) for image in images]
                 for j in range(len(pil_images)):
                     gen_image = pil_images[j]
-                    gen_image.save(os.path.join(save_dir, f"{j}.png"))
+                    gen_image.save(os.path.join(save_dir, f"part_{self.world_size*j+self.local_rank}.png"))
+                    # gen_image.save(os.path.join('/mnt/public/gpfs-jd/data/lh/ex/showo_feat/ref_image/adrien_brody',f"{counter}.png"))
+                    # counter+=1
                     del gen_image
-                del pil_images, images
-                torch.cuda.empty_cache()
-                self.model.config.mask_token_id=mti
 
+
+
+                # if isinstance(images, np.ndarray):
+                #     images = torch.from_numpy(images).to(self.args.device)
+                # if not images.is_contiguous():
+                #     images = images.contiguous()
+                # all_images_list = [torch.zeros_like(images) for _ in range(self.world_size)]
+                # dist.all_gather(all_images_list, images)
+                # print('all',torch.cat(all_images_list, dim=0).shape)
+                # all_images = torch.cat(all_images_list, dim=0)
+
+                # all_logits_list = [torch.zeros_like(logits) for _ in range(self.world_size)]
+                # dist.all_gather(all_logits_list, logits)
+                # all_logits = torch.cat(all_logits_list, dim=0)
+
+                # all_images = torch.clamp((all_images + 1.0) / 2.0, min=0.0, max=1.0)
+                # all_images *= 255.0
+                # all_images = all_images.permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
+                # print('all_numpy',all_images.shape)
+                # if self.local_rank == 0:
+                #     pil_images = [Image.fromarray(image) for image in all_images]
+                #     print('len',len(pil_images))
+                #     # tmp=counter
+                #     for j in range(len(pil_images)):
+                #         gen_image = pil_images[j]
+                #         gen_image.save(os.path.join(save_dir, f"part_{j}.png"))
+                #         # gen_image.save(os.path.join('/mnt/public/gpfs-jd/data/lh/ex/showo_feat/ref_image/adrien_brody',f"{counter}.png"))
+                #         # counter+=1
+                #         del gen_image
+                #     # counter=tmp
+                #     # for l in global_logits:
+                #     #     torch.save(l,os.path.join('/mnt/public/gpfs-jd/data/lh/ex/showo_feat/ref_image/adrien_brody',f"{counter}.pt"))
+                #     #     counter+=1
+                #     del pil_images, images
+                #     torch.cuda.empty_cache()
+
+                self.model.config.mask_token_id=mti
+                # logits=all_logits
+                # del all_logits,all_images
+                # continue
 
                 # #test token:
                 # ids=gen_token_ids[0]
                 # ids1=gen_token_ids[1]
-                # image_path='/home/daigaole/code/ex/showo_feat/tmp_result/0_ref.png'
+                # image_path='/mnt/public/gpfs-jd/data/lh/ex/showo_feat/tmp_result/0_ref.png'
                 # image_ori = Image.open(image_path).convert("RGB")
 
                 # image = image_transform(image_ori, resolution = self.config.dataset.params.resolution).to(self.args.device)
@@ -407,17 +465,22 @@ class unic_grpo(Trainer):
 
                 
                 # load save logit
-                load_dir='/home/daigaole/code/ex/showo_feat/ref_image/adrien_brody'
+                load_dir='/mnt/public/gpfs-jd/data/lh/ex/showo_feat/ref_image/adrien_brody'
                 save_logits=[]
-                for j in range(batch_size_t2i*self.num_generations*self.group):
-                    random_numbers = random.sample(range(100), 10)
+                for j in range(self.group):
+                    random_numbers = random.sample(range(100), 30)
                     tmp_list=[]
                     for idx in random_numbers:
                         l=torch.load(os.path.join(load_dir,f"{idx}.pt"))
+                        # l=torch.softmax(l,dim=-1)
                         tmp_list.append(l)
                     tmp_tensor=torch.stack(tmp_list).mean(dim=0)
                     save_logits.append(tmp_tensor)
-                self.save_logits=torch.cat(save_logits)
+                ref_per_token_logps=torch.cat(save_logits).to(self.args.device)
+                # if not signal:
+                #     self.save_logits=logits
+                #     signal=True
+                # ref_per_token_logps=self.save_logits
                     
                 
                 #calculate the rewards
@@ -433,8 +496,8 @@ class unic_grpo(Trainer):
                 # question+='<adrien_brody> in the image?\n'
                 # question+='Please use a score ranging from 0 to 10 to represent.\n'
                 # # question+='Only a score is needed,please don\'t output yes or no.\n'
-                image_path='/home/daigaole/code/ex/showo_feat/tmp_result/'
-                path_list=[os.path.join(image_path,f"{j}.png") for j in range(batch_size_t2i*self.num_generations*self.group)]
+                image_path='/mnt/public/gpfs-jd/data/lh/ex/showo_feat/tmp_result/'
+                path_list=[os.path.join(image_path,f"part_{self.world_size*j+self.local_rank}.png") for j in range(self.group)]
                 # for path in path_list:
                 #     image_ori = Image.open(path).convert("RGB")
                 #     image = image_transform(image_ori, resolution = self.config.dataset.params.resolution).to(self.args.device)
@@ -485,24 +548,35 @@ class unic_grpo(Trainer):
                     print('similarity',path,sim)
                     reward2_list.append(sim)
                 # print('score',sum(reward2_list)/len(reward2_list))
-                rewards2=torch.tensor(reward2_list).float().reshape(self.num_generations*batch_size_t2i*self.group).to(self.args.device)
+                rewards2=torch.tensor(reward2_list).float().reshape(self.group).to(self.args.device)
 
                 #gpt-4o reward
-                reward3_list=[]
-                prompt='How much do you think the man in the first image appears in the second image?\nPlease use a number ranging from 0 to 1 to represent.\nPlease only output a number.\n'
-                ref_path='/home/daigaole/code/ex/dataset/unictokens_data/concept/train/adrien_brody/0.png'
-                for path in path_list:
-                    answer=chat_with_images_gpt(prompt,[ref_path,path])
-                    answer=extract_single_number(answer)
-                    print(path,'gpt score:',answer)
-                    reward3_list.append(answer)
-                rewards3=torch.tensor(reward3_list).float().reshape(self.num_generations*batch_size_t2i*self.group).to(self.args.device)
+                # reward3_list=[]
+                # prompt='How much do you think the man in the first image appears in the second image?\nPlease use a number ranging from 0 to 1 to represent.\nPlease only output a number.\n'
+                # ref_path='/mnt/public/gpfs-jd/data/lh/ex/dataset/unictokens_data/concept/train/adrien_brody/0.png'
+                # for path in path_list:
+                #     answer=chat_with_images_gpt(prompt,[ref_path,path])
+                #     answer=extract_single_number(answer)
+                #     print(path,'gpt score:',answer)
+                #     reward3_list.append(answer)
+                # rewards3=torch.tensor(reward3_list).float().reshape(self.num_generations*batch_size_t2i*self.group).to(self.args.device)
 
-                rewards=rewards2*0.2+rewards3*0.8
-                print(rewards)
-                # rewards=rewards2
+                # rewards=rewards2*0.2+rewards3*0.8
+                
+                rewards=rewards2
+
+
+
+                
+                all_rewards_list = [torch.zeros_like(rewards) for _ in range(self.world_size)]
+                dist.all_gather(all_rewards_list, rewards)
+                all_rewards = torch.cat(all_rewards_list, dim=0)
+                rewards=all_rewards
+
+                
                 per_token_logps=logits
-                ref_per_token_logps=self.save_logits
+                # if self.local_rank==0:
+                #     print(per_token_logps.requires_grad)
                 # print(rewards,per_token_logps,ref_per_token_logps)
 
 
@@ -514,18 +588,33 @@ class unic_grpo(Trainer):
                 mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations*self.group, dim=0)
                 std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations*self.group, dim=0)
                 advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+                dist.broadcast(advantages, src=0)
+                # print(advantages)
+                advantages = advantages[self.local_rank::self.world_size]
+                # print(advantages)
 
                 self.model.train()
                 # torch.set_grad_enabled(True)
-                per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1).unsqueeze(2)
-                # print(per_token_loss)
+                # per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1).unsqueeze(2)
+
+                per_token_logps=normalize_logits(per_token_logps)
+                ref_per_token_logps=normalize_logits(ref_per_token_logps)
+                log_ratio =per_token_logps - ref_per_token_logps
+                ratio = torch.exp(log_ratio)
+                
+                
+                per_token_loss= ratio* advantages.unsqueeze(1).unsqueeze(2)
+
                 per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+
+                if self.local_rank==0:
+                    print('mean of kl',per_token_kl.mean())
+                    print('mean of per_token_loss',per_token_loss.mean())
+
                 per_token_loss = -(per_token_loss - self.beta * per_token_kl)
-                print('sum of kl',per_token_kl.sum())
-                # print("per_token_loss shape:", per_token_loss.shape)  # 实际形状
-                # print("completion_mask shape:", completion_mask.shape)  # 应该是 (8, 1024)
-                completion_mask = completion_mask.unsqueeze(-1)
-                # print(per_token_loss,per_token_kl)
+
+                # print("completion_mask shape:", completion_mask.shape)
+                completion_mask=torch.ones_like(per_token_loss)
                 loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
 
                 #log
@@ -536,10 +625,17 @@ class unic_grpo(Trainer):
                     loss.backward()
                     self.optimizer.step()
                     self.optimizer.zero_grad()
-                if self.args.t2i_data and (epoch+1) % 10 == 0:
-                    print('epoch',epoch+1,'loss',loss.item())
-                loss_list.append(loss.item())
-                print('epoch',epoch+1,'loss',loss.item())
+                # if self.args.t2i_data and (epoch+1) % 10 == 0:
+                #     print('epoch',epoch+1,'loss',loss.item())
+
+                loss_tensor = torch.tensor([loss.item()], device=loss.device)
+                dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+                world_size = dist.get_world_size()
+                avg_loss = loss_tensor.item() / world_size
+                if dist.get_rank() == 0:
+                    loss_list.append(avg_loss)
+                    print(f"loss: {avg_loss:.4f}")
+
                 # for (n1, p1), (n2, p2) in zip(self.model.named_parameters(), self.ref_model.named_parameters()):
                 #     if torch.allclose(p1, p2)!=True:
                 #         print(f"parameter {n1} is not equal")
