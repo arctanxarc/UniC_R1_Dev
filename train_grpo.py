@@ -37,6 +37,8 @@ if not dist.is_initialized():
     dist.init_process_group(backend='nccl', init_method='env://')
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
 torch.cuda.set_device(local_rank)
+# os.environ['http_proxy'] = 'http://127.0.0.1:2333'
+# os.environ['https_proxy'] = 'http://127.0.0.1:2333'
 if hasattr(torch, 'compile'):
     torch._dynamo.config.suppress_errors = True
     torch._dynamo.config.verbose = False
@@ -72,7 +74,8 @@ class GRPOScriptArguments(ScriptArguments):
         reward_funcs (`list[str]`):
             List of reward functions. Possible values: 'accuracy', 'format', 'hps', 'git', 'gdino'.
     """
-    num_gen: int = field(default=16, metadata={"help": "The number of new generations of image to generate"})
+    num_gen: int = field(default=6, metadata={"help": "The number of new generations of image to generate"})
+    num_gpus: int=field(default=3,metadata={"help":"The number of gpus"})
     image_size: int = field(default=512, metadata={"help": "The size of the image to generate"})
     reward_funcs: list[str] = field(
         default_factory=lambda: ["test"],
@@ -84,7 +87,7 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Path to the configuration file"}
     )
     data_root: str = field(
-        default="/mnt/public/gpfs-jd/data/lh/ex/dataset/unictokens_data",
+        default="/home/daigaole/code/ex/dataset/unictokens_data",
         metadata={"help": "Root directory for the dataset"}
     )
     concept: str = field(
@@ -96,7 +99,7 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Name of the training task"}
     )
     pre_trained_ckpt_name: str = field(
-        default="/mnt/public/gpfs-jd/data/lh/ex/adrien_brody/4_28_stage_2",
+        default="/home/daigaole/code/ex/adrien_brody/4_28_stage_2",
         metadata={"help": "Name of the pre-trained checkpoint"}
     )
     t2i_data: bool = field(
@@ -400,11 +403,11 @@ def update_tokens_load_from_pretrained(args,
            index_no_updates, new_total_vocab, new_token_ids, adj_token_ids, sks_token_id
 def check_param(model,args):
     #need to modify
-    for name, param in model.named_parameters():
-        if "embed_tokens" in name or "lm_head" in name:
-            param.requires_grad = True
-        else:
-            param.requires_grad = False
+    # for name, param in model.named_parameters():
+    #     if "embed_tokens" in name or "lm_head" in name:
+    #         param.requires_grad = True
+    #     else:
+    #         param.requires_grad = False
 
     #statistic
     trainable_params = []
@@ -440,7 +443,7 @@ def main(args, training_args, model_args):
     config = OmegaConf.load(args.config_file)
     tokenizer, uni_prompting, vq_model, model= setup_model(args, config)
     # ref_tokenizer,_,_,ref_model=setup_model(args, config)
-    # test_showo(model,'/mnt/public/gpfs-jd/data/lh/ex/dataset/unictokens_data/black_512x512.png')
+    # test_showo(model,'/home/daigaole/code/ex/dataset/unictokens_data/black_512x512.png')
     #make filepath to save the result
     data_root = args.data_root
     concept = args.concept
