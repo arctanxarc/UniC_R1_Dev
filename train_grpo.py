@@ -44,7 +44,7 @@ if hasattr(torch, 'compile'):
     torch._dynamo.config.verbose = False
 # add image_generation_prompt in the GRPOConfig
 @dataclass
-class GRPOConfig(GRPOConfig):
+class GrpoConfig(GRPOConfig):
     """
     Configuration class for the GRPO training script.
     """
@@ -74,8 +74,8 @@ class GRPOScriptArguments(ScriptArguments):
         reward_funcs (`list[str]`):
             List of reward functions. Possible values: 'accuracy', 'format', 'hps', 'git', 'gdino'.
     """
-    num_gen: int = field(default=6, metadata={"help": "The number of new generations of image to generate"})
-    num_gpus: int=field(default=3,metadata={"help":"The number of gpus"})
+    num_gen: int = field(default=4, metadata={"help": "The number of new generations of image to generate"})
+    num_gpus: int=field(default=2,metadata={"help":"The number of gpus"})
     image_size: int = field(default=512, metadata={"help": "The size of the image to generate"})
     reward_funcs: list[str] = field(
         default_factory=lambda: ["test"],
@@ -143,7 +143,7 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Number of epochs between evaluations"}
     )
     epoch: int = field(
-        default=30,
+        default=15,
         metadata={"help": "Total number of training epochs"}
     )
     epoch_to_load: int = field(
@@ -151,7 +151,7 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Epoch to load from the checkpoint"}
     )
     lr: float = field(
-        default=1e-6,
+        default=3e-7,
         metadata={"help": "Learning rate"}
     )
     nums_new_token_i_stage_1: int = field(
@@ -416,9 +416,9 @@ def check_param(model,args):
             trainable_params.append(param)
 
     #statistic
-    for names, p in model.named_parameters():
-        if p.requires_grad:
-            print(f"{names} requires_grad") # embed_token, lm_head会更新
+    # for names, p in model.named_parameters():
+    #     if p.requires_grad:
+    #         print(f"{names} requires_grad") # embed_token, lm_head会更新
 
     # 统计所有可训练参数数量
     trainable_params_num = sum(p.numel() for p in trainable_params)
@@ -570,6 +570,6 @@ import sys
 import json
 if __name__ == "__main__":
     print(sys.executable)
-    parser = TrlParser((GRPOScriptArguments, GRPOConfig, ModelConfig))
+    parser = TrlParser((GRPOScriptArguments, GrpoConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
     main(script_args, training_args, model_args)
