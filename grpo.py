@@ -686,7 +686,7 @@ class unic_grpo(Trainer):
                         uncond_input_ids=uncond_input_ids,
                         attention_mask=attention_mask1,
                         guidance_scale=self.config.guidance_scale,
-                        temperature=self.config.training.get("generation_temperature", 1.0),
+                        temperature=self.config.training.get("generation_temperature",1e-5),
                         timesteps=self.config.generation_timesteps,
                         noise_schedule=mask_schedule,
                         noise_type=self.config.training.get("noise_type", "mask"),
@@ -926,7 +926,7 @@ class unic_grpo(Trainer):
                 # except:
                 #     rewards3 = torch.tensor([0.8 for _ in range(self.group)], dtype=torch.float32, device=self.args.device)
                 # rewards=rewards2*0.2+rewards3*0.8
-
+                signal=1
                 try:
                     # 1. 仅在local_rank=1时调用GPT评分（避免所有进程重复调用）
                     if self.local_rank == 1:
@@ -951,11 +951,18 @@ class unic_grpo(Trainer):
                         diff=mean_re3-0.8
                         reward3_list=[i-diff for i in reward3_list]
                         rewards3 = torch.tensor(reward3_list, dtype=torch.float32, device=self.args.device)
+                        signal=0
                     else:
                         # 其他进程初始化空tensor（用于接收广播结果）
                         # 注意：需提前知道rewards3的形状，假设长度为self.group
                         rewards3 = torch.tensor([0.8 for _ in range(self.group*self.num_generations)], dtype=torch.float32, device=self.args.device)
 
+                except Exception as e:
+                    print(f'[local_rank={self.local_rank}] 评分计算失败，使用默认rewards2: {e}')
+                signal_tensor = torch.tensor([signal], dtype=torch.int, device=self.args.device)
+                dist.broadcast(signal_tensor, src=1)  # 同步 signal 到所有进程
+                signal = signal_tensor.item()  # 所有进程的 signal 现在一致
+                if signal==0:
                     # 2. 将local_rank=1的rewards3广播到所有进程
                     # 广播源为local_rank=1（确保该进程已计算出rewards3）
                     dist.broadcast(rewards3, src=1)  # src=1表示从local_rank=1广播到所有进程
@@ -964,17 +971,19 @@ class unic_grpo(Trainer):
                     # 假设总进程数=group_size，每个进程取对应位置的元素
                     # 例如：总长度为self.group，每个进程取self.group // world_size个元素
                     world_size = dist.get_world_size()
-                    per_process_length = (self.group*self.num_generations) // world_size
-                    start_idx = self.local_rank * per_process_length
-                    end_idx = start_idx + per_process_length
-                    my_rewards3 = rewards3[start_idx:end_idx].reshape(-1)  # 提取当前进程的reward
+                    total_length = self.group * self.num_generations
+
+                    # 计算当前进程应处理的索引（交叉分片）
+                    # 例如：总长度6，3进程时，进程0取0、3；进程1取1、4；进程2取2、5
+                    indices = [i for i in range(total_length) if i % world_size == self.local_rank]
+
+                    # 提取当前进程的reward
+                    my_rewards3 = rewards3[indices].reshape(-1)
 
                     # 4. 与rewards2合成（当前进程仅用自己的reward片段）
                     rewards = rewards2 * 0.2 + my_rewards3 * 0.8
-
-                except Exception as e:
-                    print(f'[local_rank={self.local_rank}] 评分计算失败，使用默认rewards2: {e}')
-                    rewards = rewards2
+                else:
+                    rewards=rewards2
                 # reward_qa=torch.tensor(reward_qa_list).float().reshape(self.group).to(self.args.device)
                 # reward_vqa=torch.tensor(reward_vqa_list).float().reshape(self.group).to(self.args.device)
                 reward_text=torch.tensor(reward_text).float().reshape(self.group).to(self.args.device)
