@@ -326,7 +326,8 @@ class Showo(ModelMixin, ConfigMixin):
             else:
                 idx = torch.cat((idx, idx_next), dim=1)
 
-            if eot_token is not None and idx_next.cpu() == eot_token:
+            if eot_token is not None and (idx_next == eot_token).all():
                 break
 
         return result
+
