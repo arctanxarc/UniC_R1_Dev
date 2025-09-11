@@ -989,7 +989,7 @@ class unic_grpo(Trainer):
                 reward_text=torch.tensor(reward_text).float().reshape(self.group).to(self.args.device)
                 rewards=rewards*0.7+reward_text*0.3
                 counter+=1
-                update_best_results(path_list,rewards.cpu().detach().numpy().tolist(),counter)
+                #update_best_results(path_list,rewards.cpu().detach().numpy().tolist(),counter)
 
                 
                 all_rewards_list = [torch.zeros_like(rewards) for _ in range(self.world_size)]
