@@ -48,98 +48,54 @@ class GrpoConfig(GRPOConfig):
     """
     Configuration class for the GRPO training script.
     """
-    new_generations_image: int = field(default=1, metadata={"help": "The number of new generations of image to generate"})
-    # image_token_num_per_image: int = field(default=576, metadata={"help": "The number of image tokens to generate"})
-    # image_gen_temperature: float = field(default=1.0, metadata={"help": "The temperature for image generation"}) # HACK, this is always 1.0
     cfg_weight: float = field(default=3.0, metadata={"help": "The cfg weight for image generation"})
-    reasoning_prompt_path: Optional[str] = field(
-        default='',
-    )
     img_size: int = field(default=512, metadata={"help": "The size of the image to generate"})
     patch_size: int = field(default=16, metadata={"help": "The patch size of the image to generate"})
     deepspeed: bool = field(default=False)
-    # max_textcot_length: int = field(default=None, metadata={"help": "The maximum length of the text cot"})
-    # hps_ckpt_path: str = field(default=None, metadata={"help": "The path to the hps checkpoint"})
-    # git_ckpt_path: str = field(default=None, metadata={"help": "The path to the git checkpoint"})
-    # gdino_ckpt_path: str = field(default=None, metadata={"help": "The path to the gdino checkpoint"})
-    # gdino_config_path: str = field(default=None, metadata={"help": "The path to the gdino config"})
-    # orm_ckpt_path: str = field(default=None, metadata={"help": "The path to the orm checkpoint"})
     
 @dataclass
 class GRPOScriptArguments(ScriptArguments):
     """
     Script arguments for the GRPO training script.
-
-    Args:
-        reward_funcs (`list[str]`):
-            List of reward functions. Possible values: 'accuracy', 'format', 'hps', 'git', 'gdino'.
     """
-    num_gen: int = field(default=4, metadata={"help": "The number of new generations of image to generate"})
-    num_gpus: int=field(default=2,metadata={"help":"The number of gpus"})
+    llm:str=field(default='gemini')
+    data_root:str=field(
+        default="/share/project/emllm_mnt.1d/mnt/hpfs/baaiei/daigaole/code/UnicR1/dataset/unictokens_data"
+    )
+    inverse_prompt:bool=field(default=True)
+    save_dir:str=field(default="./tmp_result/")
+    work_dir:str=field(default="./")
+    batch_num:int=field(default=10)
+    batch_size:int=field(default=1)
+    num_gen: int = field(default=8, metadata={"help": "The number of new generations of image to generate"})
+    num_gpus: int=field(default=4,metadata={"help":"The number of gpus"})
     image_size: int = field(default=512, metadata={"help": "The size of the image to generate"})
     reward_funcs: list[str] = field(
         default_factory=lambda: ["test"],
         metadata={"help": "List of reward functions. Possible values: 'test'"},
     )
-    tmp: int =field(default=22,metadata={"help":"to do a test"})
     config_file: str = field(
         default="configs/showo_demo_512x512.yaml",
         metadata={"help": "Path to the configuration file"}
-    )
-    data_root: str = field(
-        default="/home/daigaole/code/ex/dataset/unictokens_data",
-        metadata={"help": "Root directory for the dataset"}
     )
     concept: str = field(
         default="adrien_brody",
         metadata={"help": "Concept for the model"}
     )
-    task_name: str = field(
-        default="4_25(3)_mmu_stage2",
-        metadata={"help": "Name of the training task"}
-    )
     pre_trained_ckpt_name: str = field(
-        default="/home/daigaole/code/ex/adrien_brody/4_28_stage_2",
+        default="/share/project/emllm_mnt.1d/mnt/hpfs/baaiei/daigaole/code/UnicR1/weight/adrien_brody/",
         metadata={"help": "Name of the pre-trained checkpoint"}
-    )
-    t2i_data: bool = field(
-        default=True,
-        metadata={"help": "Enable T2I data"}
-    )
-    mmu_data: bool = field(
-        default=False,
-        metadata={"help": "Enable MMU data"}
-    )
-    more_t2i_data: bool = field(
-        default=False,
-        metadata={"help": "Enable more T2I data"}
     )
     device: str = field(
         default=torch.device(f"cuda:{local_rank}"),
         metadata={"help": "Device to use for training"}
     )
-    t2i_bsz: int = field(
-        default=1,
-        metadata={"help": "Batch size for T2I data"}
-    )
-    mmu_bsz: int = field(
-        default=1,
-        metadata={"help": "Batch size for MMU data"}
-    )
     save_training_image: bool = field(
         default=False,
         metadata={"help": "Save training images"}
     )
-    l2_lambda: float = field(
-        default=0.0,
-        metadata={"help": "L2 regularization coefficient"}
-    )
-    caption_training: bool = field(
-        default=False,
-        metadata={"help": "Enable caption training"}
-    )
     interval_epochs: int = field(
-        default=5,
+        default=2,
         metadata={"help": "Number of epochs between evaluations"}
     )
     epoch: int = field(
@@ -151,7 +107,7 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Epoch to load from the checkpoint"}
     )
     lr: float = field(
-        default=3e-7,
+        default=1e-7,
         metadata={"help": "Learning rate"}
     )
     nums_new_token_i_stage_1: int = field(
@@ -161,10 +117,6 @@ class GRPOScriptArguments(ScriptArguments):
     nums_new_token_i_stage_2: int = field(
         default=8,
         metadata={"help": "Number of new tokens in stage 2"}
-    )
-    less_t2i_data: bool = field(
-        default=False,
-        metadata={"help": "Use less T2I data"}
     )
 
 def make_detection_prompt(nouns):
@@ -445,11 +397,8 @@ def main(args, training_args, model_args):
     # ref_tokenizer,_,_,ref_model=setup_model(args, config)
     # test_showo(model,'/home/daigaole/code/ex/dataset/unictokens_data/black_512x512.png')
     #make filepath to save the result
-    data_root = args.data_root
     concept = args.concept
-    save_path = os.path.join("saves", concept, args.task_name)
-    os.makedirs(save_path, exist_ok=True)
-
+    args.pre_trained_ckpt_name=args.pre_trained_ckpt_name.replace('adrien_brody',f"{args.concept}")
     #set up training arch
     tokenizer, model, orig_embeds, orig_lm_head_weight, \
     orig_lm_head_bias, index_no_updates, new_total_vocab, new_token_ids, adj_token_ids, sks_token_id \
@@ -476,45 +425,6 @@ def main(args, training_args, model_args):
     model.train()
     optimizer=check_param(model,args)
 
-    # set up dataset
-    if args.t2i_data:
-        load_caption_training_path = os.path.join("saves", concept, args.pre_trained_ckpt_name, "captions.json")
-        t2i_dataloader = get_personalized_t2i_dataloader(data_root, concept, tokenizer, args.image_size, 
-                                                         batch_size=args.t2i_bsz, num_workers=0, max_length=128, 
-                                                         nums_new_token_i=args.nums_new_token_i_stage_1 + args.nums_new_token_i_stage_2,
-                                                         more_data = args.more_t2i_data, inited = True, system_prompt_t2i = False, 
-                                                         caption_training = args.caption_training, load_caption_training_path = load_caption_training_path,
-                                                         less_t2i_data=args.less_t2i_data,)
-    if args.mmu_data:
-        mmu_dataloader = get_personalized_mmu_dataloader(data_root, concept, tokenizer, args.image_size, 
-                                                         batch_size=args.mmu_bsz, num_workers=0, max_length=128, 
-                                                         new_tokens=True, stage=1, 
-                                                         nums_new_token_i_stage_1=args.nums_new_token_i_stage_1,
-                                                         nums_new_token_i_stage_2=args.nums_new_token_i_stage_2,)
-
-    if args.t2i_data and args.mmu_data:
-        iterables = {
-            'mmu_flow': mmu_dataloader,
-            't2i_flow': t2i_dataloader
-        }
-        combined_dataloader = CombinedLoader(iterables, mode="max_size_cycle")
-    elif args.t2i_data:
-        iterables = {
-            't2i_flow': t2i_dataloader
-        }
-        combined_dataloader = CombinedLoader(iterables, mode="max_size_cycle")
-    elif args.mmu_data:
-        iterables = {
-            'mmu_flow': mmu_dataloader
-        }
-        combined_dataloader = CombinedLoader(iterables, mode="max_size_cycle")
-    else:
-        raise ValueError("No dataset loaded")
-    # finish setting dataset
-    combined_dataloader_list = list(combined_dataloader)
-    
-
-
 
     trainer_cls = unic_grpo
     print("using: ", trainer_cls)
@@ -527,7 +437,6 @@ def main(args, training_args, model_args):
         args=args,
         train_args=training_args,
         config=config,
-        dataset=combined_dataloader_list,
         vq_model=vq_model,
         uni_prompting=uni_prompting,
         optimizer=optimizer,
