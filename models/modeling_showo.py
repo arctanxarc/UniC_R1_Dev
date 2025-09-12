@@ -150,7 +150,18 @@ class Showo(ModelMixin, ConfigMixin):
                 logits = self(input_ids, attention_mask=attention_mask)
                 logits = logits[:, -(num_vq_tokens + 1):-1, config.model.showo.llm_vocab_size + num_new_special_tokens:-1]
             # print(cond_logits,uncond_logits,logits)
+            logits = torch.nan_to_num(logits, nan=-1e9, posinf=-1e9, neginf=-1e9)
             probs = logits.softmax(dim=-1)
+            probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+            probs = torch.clamp(probs, min=0.0)
+            # 修复2：重新归一化概率（确保每行和为1，满足multinomial要求）
+            probs_sum = probs.sum(dim=-1, keepdim=True)
+            zero_sum_mask = probs_sum < 1e-9
+            # 处理概率和为0的极端情况（用均匀分布兜底）
+            if torch.any(zero_sum_mask).item():
+                probs[zero_sum_mask] = 1.0 / probs.size(-1)
+            else:
+                probs = probs / probs_sum
             sampled = probs.reshape(-1, logits.size(-1))
             sampled_ids = torch.multinomial(sampled, 1, generator=generator)[:, 0].view(*logits.shape[:-1])
             # sampled_ids = torch.argmax(sampled, dim=-1).view(*logits.shape[:-1])
@@ -310,12 +321,23 @@ class Showo(ModelMixin, ConfigMixin):
 
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
+            logits = torch.nan_to_num(logits, nan=-1e9, posinf=-1e9, neginf=-1e9)
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
+            probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+            probs = torch.clamp(probs, min=0.0)
+            # 修复2：重新归一化概率（确保每行和为1，满足multinomial要求）
+            probs_sum = probs.sum(dim=-1, keepdim=True)
+            zero_sum_mask = probs_sum < 1e-9
+            # 处理概率和为0的极端情况（用均匀分布兜底）
+            if torch.any(zero_sum_mask).item():
+                probs[zero_sum_mask] = 1.0 / probs.size(-1)
+            else:
+                probs = probs / probs_sum
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
             result.append(idx_next[0][0])
@@ -326,8 +348,11 @@ class Showo(ModelMixin, ConfigMixin):
             else:
                 idx = torch.cat((idx, idx_next), dim=1)
 
-            if eot_token is not None and (idx_next == eot_token).all():
-                break
+            if eot_token is not None:
+                # 确保比较在相同设备上，并且取出标量值
+                if idx_next.to(device) == torch.tensor(eot_token, device=device):
+                    break
 
         return result
+
 
