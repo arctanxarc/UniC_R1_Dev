@@ -1,6 +1,10 @@
 from zai import ZhipuAiClient
 import base64
-
+import os
+import vertexai
+from vertexai.generative_models import GenerativeModel, Part
+import vertexai.preview.generative_models as generative_models
+os.environ['GOOGLE_APPLICATION_CREDENTIALS']='./gemini_exp.json'
 def image_to_base64(image_path):
     """
     将本地图片文件编码为 Base64 字符串
@@ -20,11 +24,52 @@ def image_to_base64(image_path):
     except Exception as e:
         return f"编码失败：{str(e)}"
 
+def evaluate(image_urls):
+    prompt="""
+**Act as a professional image quality and identity evaluation system. You will receive one reference image (the first one) followed by multiple generated images (others) for assessment. For each generated image, evaluate based on these criteria:**
+
+1.  **Structural Integrity and Reasonableness (40% weight):** Assess the inherent rationality of the generated image itself. For human faces: evaluate facial symmetry, proportional distribution of facial features, anatomical correctness, and natural appearance. For objects: evaluate structural coherence, physical plausibility, and absence of deformities or artifacts.
+
+2.  **Identity Faithfulness to Reference (60% weight):** Determine the degree to which the person/object in the generated image is the same as in the reference image. Consider facial features, distinctive characteristics, and overall likeness for persons; consider form, texture, and defining attributes for objects.
+
+**Scoring Guidelines:**
+- Provide a single score from 1 to 100 for each generated image, where a higher score indicates a better quality image that is more faithful to the reference.
+- **Ensure meaningful score distribution:** Apply strict grading with significant variance (e.g., 50-100 range) to clearly differentiate between excellent, good, average, and poor results. Avoid score compression.Please ensure the average score is 80.
+- Output **only** a Python list of numerical scores (e.g., `[85, 72, 78, 95, 70]`) with no additional text, explanations, or formatting.
+"""
+    vertexai.init(project="mmu-gemini-caption-1-5pro", location="us-central1")
+    model = GenerativeModel("gemini-2.5-pro")
+    def generate(filenames):
+        """
+        Generates a description for an image file using the Gemini model.
+        """
+        contents=[]
+        for filename in filenames:
+            with open(filename, "rb") as f:
+                image_content = f.read()
+            image_file = Part.from_data(image_content, mime_type="image/png") 
+            contents.append(image_file)
+        
+        contents.append(prompt)
+        responses = model.generate_content(
+            contents, generation_config=generation_config, safety_settings=safety_settings,
+        )
+        return responses.text
+
+    generation_config = { "max_output_tokens": 2048, "temperature": 1e-5, "top_p": 1.0}
+    safety_settings = {
+        generative_models.HarmCategory.HARM_CATEGORY_HATE_SPEECH: generative_models.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+        generative_models.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: generative_models.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+        generative_models.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: generative_models.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+        generative_models.HarmCategory.HARM_CATEGORY_HARASSMENT: generative_models.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    }
+    return generate(image_urls)
+
 
 def glm_evaluate(image_paths):
-    client = ZhipuAiClient(api_key="85a57f3de9fb4d8fa9b34d63c9e2aba3.eTv6vtDpYukhYEWc")
+    client = ZhipuAiClient(api_key="66b96eb48a244f08835e7c7b02e04610.C8DhlMDgoGJuoJmh")
     prompt="""
-**Act as a professional image quality and identity evaluation system. You will receive one reference image followed by multiple generated images for assessment. For each generated image, evaluate based on these criteria:**
+**Act as a professional image quality and identity evaluation system. You will receive one reference image (the first one) followed by multiple generated images (others) for assessment. For each generated image, evaluate based on these criteria:**
 
 1.  **Structural Integrity and Reasonableness (40% weight):** Assess the inherent rationality of the generated image itself. For human faces: evaluate facial symmetry, proportional distribution of facial features, anatomical correctness, and natural appearance. For objects: evaluate structural coherence, physical plausibility, and absence of deformities or artifacts.
 
@@ -73,20 +118,34 @@ def glm_evaluate(image_paths):
     )
     # print(response.choices[0].message.content)
     return response.choices[0].message.content
-
-def glm_extract(text,question):
-    client = ZhipuAiClient(api_key="85a57f3de9fb4d8fa9b34d63c9e2aba3.eTv6vtDpYukhYEWc")
+def extract(text,cla=None):
     prompt=f'''
-    The input for a small LLM is {question}.
-    The output of the small LLM is {text}.
-    Please recognize the valid part of {text} and output it(less than 20 words).
-    Please notice: only output the valid part,do not output any extra info.
-    If there is nothing valid,then give an empty output.
-    ''' 
-    prompt=f'''
-    Please extract the information about <adrien_brody> in the text: {text}.
+    Please extract the information about the {cla} described in the text: {text}.
     Output them in a simple sentence less than 20 words.
-    If there is no information about <adrien_brody>,then give an empty output.
+    If there is no information that describes {cla} ,then give an empty output.
+    Notice: Do not output any other information.
+    '''
+    vertexai.init(project="mmu-gemini-caption-1-5pro", location="us-central1")
+    model = GenerativeModel("gemini-2.5-pro")
+    generation_config = { "max_output_tokens": 2048, "temperature": 1e-5, "top_p": 1.0}
+    safety_settings = {
+        generative_models.HarmCategory.HARM_CATEGORY_HATE_SPEECH: generative_models.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+        generative_models.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: generative_models.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+        generative_models.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: generative_models.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+        generative_models.HarmCategory.HARM_CATEGORY_HARASSMENT: generative_models.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    }
+    contents=[]
+    contents.append(prompt)
+    responses = model.generate_content(
+        contents, generation_config=generation_config, safety_settings=safety_settings,
+    )
+    return responses.text
+def glm_extract(text,cla=None):
+    client = ZhipuAiClient(api_key="66b96eb48a244f08835e7c7b02e04610.C8DhlMDgoGJuoJmh")
+    prompt=f'''
+    Please extract the information about the {cla} described in the text: {text}.
+    Output them in a simple sentence less than 20 words.
+    If there is no information that describes {cla} ,then give an empty output.
     Notice: Do not output any other information.
     '''
     response = client.chat.completions.create(
@@ -121,8 +180,8 @@ def glm_extract(text,question):
 # ------------------- 调用示例 -------------------
 if __name__ == "__main__":
     # 替换为你的本地图片路径
-    # print(glm_evaluate(["/home/daigaole/code/ex/showo_feat/best_result/part_4.png","/home/daigaole/code/ex/showo_feat/best_result/part_5.png","/home/daigaole/code/ex/showo_feat/best_result/part_6.png"]))
-    print(glm_extract('<adrien_brody>\'s name is <adrien_brody>','Please output something about <adrien_brody>'))
+    # print(evaluate(["/share/project/emllm_mnt.1d/mnt/hpfs/baaiei/daigaole/code/UnicR1/showo/tmp_result/best_image/adrien_brody/image_000004.png"]))
+    print(extract('<adrien_brody>\'s name is <adrien_brody>','man'))
     exit()
     local_image_path = "/home/daigaole/code/ex/showo_feat/best_result/part_4.png"  # 支持 PNG、JPG、JPEG、BMP 等常见格式
     base64_result = image_to_base64(local_image_path)
@@ -170,3 +229,4 @@ if __name__ == "__main__":
 
     # 获取回复
     print(response.choices[0].message.content)
+
