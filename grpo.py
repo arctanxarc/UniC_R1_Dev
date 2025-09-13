@@ -202,7 +202,7 @@ class unic_grpo(Trainer):
                     for token in new_tokens_stage_2:
                         condition+=token
                     condition+=f'<{self.args.concept}>.\n'
-                    if epoch>self.args.epoch*0.3:
+                    if epoch>self.args.epoch*(0.3):
                         # us_prompt="what is in the image?"
                         # us_prompt="Describe the person in this image using 3-5 concise descriptive adjectives focused on appearance, expression, and demeanor.Do not output extra information except these adjectives."
                         r=random.randint(1,int(len(self.t2i_condition["personalized_driven_generation"])*self.rate))
@@ -247,7 +247,14 @@ class unic_grpo(Trainer):
                         
                         logging.info(f"Question:{question}")
                         logging.info(f"Answer:{more_prompt}")
-                        reward_text.append(calculate_bleu(self.info['extra_info'][r-1],more_prompt))
+                        text_score=[]
+                        text_gt=[0 for _ in range(len(self.info['extra_info']))]
+                        text_gt[r-1]=1
+                        for r in range(len(self.info['extra_info'])):
+                            text_score.append(calculate_bleu(self.info['extra_info'][r],more_prompt))
+                        print('gtscore',text_gt)
+                        print('bleuscore',text_score)
+                        reward_text.append((2.0-calculate_distance(text_gt,text_score))/2)
                         logging.info(f"{self.local_rank}: Bleu score is {reward_text}")
                         if self.args.llm=='gemini':
                             more_prompt=extract(more_prompt,self.info["class"])
@@ -403,8 +410,8 @@ class unic_grpo(Trainer):
                 del gen_token_ids
                 for j in range(len(pil_images)):
                     gen_image = pil_images[j]
-                    mkdir(os.path.join(save_dir,f'images/{self.args.concept}'))
-                    tmp_image_path=os.path.join(save_dir,f'images/{self.args.concept}',f"part_{self.world_size*j+self.local_rank}.png")
+                    mkdir(os.path.join(save_dir,f'images/{self.args.concept}',f"Epoch{epoch}"))
+                    tmp_image_path=os.path.join(save_dir,f'images/{self.args.concept}',f"Epoch{epoch}",f"batch_{batch_idx}_{self.world_size*j+self.local_rank}.png")
                     gen_image.save(tmp_image_path)
                     # gen_image.save(os.path.join('/home/daigaole/code/ex/showo_feat/ref_image/adrien_brody',f"{counter}.png"))
                     # counter+=1
@@ -450,9 +457,9 @@ class unic_grpo(Trainer):
                 # question+='<adrien_brody> in the image?\n'
                 # question+='Please use a score ranging from 0 to 10 to represent.\n'
                 # # question+='Only a score is needed,please don\'t output yes or no.\n'
-                image_path=os.path.join(save_dir,f'images/{self.args.concept}')
-                path_list=[os.path.join(image_path,f"part_{self.world_size*j+self.local_rank}.png") for j in range(self.group)]
-                all_path_list=[os.path.join(image_path,f"part_{j}.png") for j in range(self.group*self.num_generations)]
+                image_path=os.path.join(save_dir,f'images/{self.args.concept}',f"Epoch{epoch}")
+                path_list=[os.path.join(image_path,f"batch_{batch_idx}_{self.world_size*j+self.local_rank}.png") for j in range(self.group)]
+                all_path_list=[os.path.join(image_path,f"batch_{batch_idx}_{j}.png") for j in range(self.group*self.num_generations)]
 
                 fm=''
                 for f in ['0.png','0.jpg','0.jepg']:
@@ -464,7 +471,7 @@ class unic_grpo(Trainer):
                 #clip reward
                 reward2_list=[]
                 clip_model=SHOWO_P_CLIPEvaluator(
-                    "cuda:6",
+                    "cuda:3",
                     clip_model=os.path.join(self.args.work_dir,'ViT-B-32.pt'),
                     data_root=self.args.data_root,
                     work_dir=self.args.work_dir,
