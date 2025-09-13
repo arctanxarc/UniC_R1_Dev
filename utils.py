@@ -85,8 +85,8 @@ def save_distributed_model(
 
 def load_distributed_model(
     model, 
-    optimizer, 
-    save_dir, 
+    optimizer=None, 
+    save_dir=None, 
     use_deepspeed=False, 
     device="cuda"
 ):
@@ -152,7 +152,61 @@ def load_distributed_model(
     # 确保模型在目标设备
     model.to(device)
     return model, optimizer, epoch
+import torch
+# 需确保 safe_globals 函数已导入（若来自自定义工具库，需保留对应导入）
+# 示例导入（根据实际项目调整）：from your_project.utils import safe_globals
 
+def load_single_model_weights_from_file(
+    model, 
+    weight_file_path, 
+    device="cuda"
+):
+    # 1. 基础校验：检查权重文件是否存在
+    if not os.path.exists(weight_file_path):
+        raise FileNotFoundError(f"模型权重文件不存在：{weight_file_path}")
+
+    # 2. 打印加载信息
+    print(f"正在加载模型权重文件：{weight_file_path}")
+
+    # 3. 安全加载权重（适配PyTorch 2.6+ weights_only安全模式，避免恶意代码）
+    # safe_globals 上下文：允许加载 torch.torch_version.TorchVersion 合法类型
+    with safe_globals([torch.torch_version.TorchVersion]):
+        load_data = torch.load(
+            weight_file_path,
+            map_location=device,  # 加载时直接映射到目标设备，减少显存占用
+            weights_only=True     # 安全模式：仅加载权重数据，拒绝执行外部代码
+        )
+
+    # 4. 验证权重文件核心结构（必须包含模型参数和轮次信息）
+    required_keys = ["model_state_dict", "epoch"]
+    for key in required_keys:
+        if key not in load_data:
+            raise KeyError(
+                f"权重文件 {weight_file_path} 结构不合法，缺少必要键：{key}\n"
+                "请确保权重文件是通过 'torch.save({\"model_state_dict\": model.state_dict(), \"epoch\": epoch, ...})' 保存的"
+            )
+
+    # 5. 加载模型参数
+    model.load_state_dict(load_data["model_state_dict"])
+    print(f"模型权重加载完成！对应训练轮次：epoch {load_data['epoch']}")
+
+    # 6. 确保模型移动到目标设备（避免加载后设备不匹配）
+    model.to(device)
+
+    # 返回加载后的模型和训练轮次
+    return model, load_data["epoch"]
+import math
+
+def calculate_distance(list1, list2):
+    """计算两个列表的欧氏距离"""
+    if len(list1) != len(list2):
+        raise ValueError("两个列表的长度必须相同")
+    
+    squared_diff_sum = 0.0
+    for a, b in zip(list1, list2):
+        squared_diff_sum += (a - b) **2
+    
+    return math.sqrt(squared_diff_sum)
 def calculate_bleu(reference, candidate):
     # 将字符串转换为字符列表（适用于中文）
     reference_tokens = list(reference)
@@ -165,6 +219,7 @@ def calculate_bleu(reference, candidate):
                 smoothing_function=smoothie)
     
     return bleu_score
+
 def extract_list_from_response(response_text: str) -> List[Any]:
     """
     从大模型回答中提取列表并解析成Python列表
