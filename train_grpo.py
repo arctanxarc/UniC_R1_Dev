@@ -58,7 +58,7 @@ class GRPOScriptArguments(ScriptArguments):
     """
     Script arguments for the GRPO training script.
     """
-    llm:str=field(default='gemini')
+    llm:str=field(default='glm')
     data_root:str=field(
         default="/share/project/emllm_mnt.1d/mnt/hpfs/baaiei/daigaole/code/UnicR1/dataset/unictokens_data"
     )
@@ -67,8 +67,8 @@ class GRPOScriptArguments(ScriptArguments):
     work_dir:str=field(default="./")
     batch_num:int=field(default=10)
     batch_size:int=field(default=1)
-    num_gen: int = field(default=8, metadata={"help": "The number of new generations of image to generate"})
-    num_gpus: int=field(default=4,metadata={"help":"The number of gpus"})
+    num_gen: int = field(default=9, metadata={"help": "The number of new generations of image to generate"})
+    num_gpus: int=field(default=3,metadata={"help":"The number of gpus"})
     image_size: int = field(default=512, metadata={"help": "The size of the image to generate"})
     reward_funcs: list[str] = field(
         default_factory=lambda: ["test"],
