@@ -12,7 +12,7 @@ import torch
 import torch.utils.data
 import json
 import transformers
-import deepspeed
+# import deepspeed
 from datasets import Dataset, IterableDataset
 from packaging import version
 import torch.distributed as dist
@@ -22,7 +22,8 @@ from clip_eval import SHOWO_P_CLIPEvaluator
 from models import Showo, MAGVITv2, get_mask_chedule
 from clip.model import build_model
 from training.prompting_utils import UniversalPrompting, create_attention_mask_predict_next, create_attention_mask_for_mmu
-from transformers.integrations import is_deepspeed_zero3_enabled 
+from transformers import get_cosine_schedule_with_warmup
+# from transformers.integrations import is_deepspeed_zero3_enabled 
 # from gpttest import chat_with_images_gpt
 # from api import evaluate,extract
 # from record_best import update_best_results
@@ -41,12 +42,12 @@ from transformers import (
     TrainerCallback,
     is_wandb_available,
 )
-from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
-from deepspeed import zero
+# from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+# from deepspeed import zero
 from transformers.utils import is_peft_available
 from training.utils import get_config, flatten_omega_conf, mask_or_random_replace_tokens, AverageMeter
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
-from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
+from trl.models import create_reference_model,  unwrap_model_for_generation
 from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 import shutil
@@ -110,18 +111,17 @@ class unic_grpo(Trainer):
         self.local_rank = local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         # # Reference model
-        self.deepspeed_enabled = train_args.deepspeed
-        if self.deepspeed_enabled:
-            self.model, self.optimizer, _, _ = deepspeed.initialize(
-                model=model,
-                optimizer=optimizer,
-                config_params=os.path.join(self.work_dir,'ds_config.json'),
-                model_parameters=filter(lambda p: p.requires_grad, model.parameters())
-            )
-            self.model.module.gradient_checkpointing_enable()
-        else:
-            self.model=model
-            self.optimizer=optimizer
+        self.model=model
+        self.optimizer=optimizer
+        num_training_steps = args.batch_num * args.epoch
+        num_warmup_steps = args.batch_num  # 10%的热身步数
+
+        # 创建调度器
+        self.scheduler = get_cosine_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps
+        )
         self.num_generations = args.num_gen  # = G in the GRPO paper
         self.group=int(self.num_generations/args.num_gpus)
         self.num_generations=int(self.num_generations/self.group)
@@ -134,11 +134,32 @@ class unic_grpo(Trainer):
         self.uni_prompting=uni_prompting
         self.tokenizer=tokenizer
         self.beta=0.01
-        self.rate=0.7
+        self.rate=0.5
+        self.split_rate=0.5
         self.ref_model=ref_model(self.args)
         self.info=read_json_to_dict(os.path.join(self.args.data_root,'concept/train',self.args.concept,'info.json'))
         self.t2i_condition=read_json_to_dict(os.path.join(self.args.data_root,'concept/test',self.args.concept,'t2i_conditions.json'))
         self.vqa=read_json_to_dict(os.path.join(self.args.data_root,'concept/train',self.args.concept,'conversations.json'))
+        self.ablation_mode=self.args.ablation_mode
+        self.mode=[]
+        if self.ablation_mode=='ur':
+            self.mode=['u' for _ in range(int(self.args.batch_num/2))]
+            for _  in range(self.args.batch_num-int(self.args.batch_num/2)):
+                self.mode.append('r')
+        elif self.ablation_mode=='ru':
+            self.mode=['r' for _ in range(self.args.batch_num-int(self.args.batch_num/2))]
+            for _  in range(int(self.args.batch_num/2)):
+                self.mode.append('u')
+        else:
+            for _ in range(len(self.args.batch_num)):
+                rand_seed=random.random()
+                modified_rate=int(self.args.batch_num/2)/self.args.batch_num
+                if rand_seed<=modified_rate:
+                    self.mode.append('u')
+                else:
+                    self.mode.append('r')
+        logging.info(f"using ablation mode:{self.ablation_mode}")
+
         mkdir(os.path.join(self.args.save_dir,'model_weights',self.args.concept))
         # if self.local_rank==0:
         #     save_distributed_model(self.model,self.optimizer,os.path.join(self.args.save_dir,'model_weights',self.args.concept),epoch=0)
@@ -202,10 +223,10 @@ class unic_grpo(Trainer):
                     for token in new_tokens_stage_2:
                         condition+=token
                     condition+=f'<{self.args.concept}>.\n'
-                    if epoch>self.args.epoch*(0.3):
+                    if self.mode[batch_idx]=='r':
                         # us_prompt="what is in the image?"
                         # us_prompt="Describe the person in this image using 3-5 concise descriptive adjectives focused on appearance, expression, and demeanor.Do not output extra information except these adjectives."
-                        r=random.randint(1,int(len(self.t2i_condition["personalized_driven_generation"])*self.rate))
+                        r=random.randint(1,int((len(self.t2i_condition["personalized_driven_generation"])+1)*self.rate))
                         self.r=r
                         question=self.t2i_condition["personalized_driven_generation"][r-1]
                         us_prompt=f'''
@@ -252,9 +273,18 @@ class unic_grpo(Trainer):
                         text_gt[r-1]=1
                         for r in range(len(self.info['extra_info'])):
                             text_score.append(calculate_bleu(self.info['extra_info'][r],more_prompt))
-                        print('gtscore',text_gt)
-                        print('bleuscore',text_score)
-                        reward_text.append((2.0-calculate_distance(text_gt,text_score))/2)
+                        text_mean=sum(text_score)
+                        t_score=[0]*len(self.info['extra_info'])
+                        if text_mean>0:
+                            t_score=[t/text_mean for t in text_score]
+                        print('gtscore',text_gt,text_mean)
+                        print('bleuscore',t_score)
+                        final_score=(2.0-calculate_distance(text_gt,t_score))/2
+                        if final_score<=0.5:
+                            final_score=0
+                        else:
+                            final_score=(final_score-0.5)*2
+                        reward_text.append(final_score)
                         logging.info(f"{self.local_rank}: Bleu score is {reward_text}")
                         if self.args.llm=='gemini':
                             more_prompt=extract(more_prompt,self.info["class"])
@@ -417,7 +447,7 @@ class unic_grpo(Trainer):
                     # counter+=1
                     del gen_image
                 torch.cuda.empty_cache()
-
+                dist.barrier()
                 self.model.config.mask_token_id=mti
                 
                 # load save logit
@@ -470,6 +500,7 @@ class unic_grpo(Trainer):
 
                 #clip reward
                 reward2_list=[]
+                    
                 clip_model=SHOWO_P_CLIPEvaluator(
                     "cuda:3",
                     clip_model=os.path.join(self.args.work_dir,'ViT-B-32.pt'),
@@ -478,15 +509,45 @@ class unic_grpo(Trainer):
                     save_dir=fm
                 )
                 for path in path_list:
-                    clip_model.save_dir=path
-                    sim=clip_model.evaluate_concept(self.args.concept,'',0)
-                    print('similarity',path,sim)
-                    if sim<0.5:
-                        sim=0
+                    if 'man' in self.info['class'].lower():
+                        sig1=0
+                        sig2=0
+                        try:
+                            fr_score=face_recognition_score(path,self.args.data_root,self.args.concept)
+                            sig1=1
+                        except:
+                            print('---------------Face recognition False!')
+                            pass
+                        try:
+                            fn_score=facenet_score(path,self.args.data_root,self.args.concept)
+                            sig2=1
+                        except:
+                            print('---------------FaceNet False!')
+                            pass
+                        if sig1==1 and sig2==1:
+                            sim=0.7*fn_score+0.3*fr_score
+                        elif sig1==1:
+                            sim=fr_score
+                        elif sig2==1:
+                            sim=fn_score
+                        else:
+                            clip_model.save_dir=path
+                            sim=clip_model.evaluate_concept(self.args.concept,'',0)
+                            if sim<0.5:
+                                sim=0
+                            else:
+                                sim=2*(sim-0.5)
+                        reward2_list.append(sim)
                     else:
-                        sim=2*(sim-0.5)
-                    reward2_list.append(sim)
+                        clip_model.save_dir=path
+                        sim=clip_model.evaluate_concept(self.args.concept,'',0)
+                        if sim<0.5:
+                            sim=0
+                        else:
+                            sim=2*(sim-0.5)
+                        reward2_list.append(sim)
                 # print('score',sum(reward2_list)/len(reward2_list))
+                print('similarity',path,sim)
                 rewards2=torch.tensor(reward2_list).float().reshape(self.group).to(self.args.device)
                 
 
@@ -572,11 +633,12 @@ class unic_grpo(Trainer):
                     my_rewards3 = rewards3[indices].reshape(-1)
 
                     # 4. 与rewards2合成（当前进程仅用自己的reward片段）
-                    rewards = rewards2 * 0.2 + my_rewards3 * 0.8
+
+                    rewards = rewards2 * 0.4 + my_rewards3 * 0.6
                 else:
                     rewards=rewards2
                 reward_text=torch.tensor(reward_text).float().reshape(self.group).to(self.args.device)
-                rewards=rewards*0.7+reward_text*0.3
+                rewards=rewards*0.65+reward_text*0.35
                 counter+=1
                 # update_best_results(path_list,rewards.cpu().detach().numpy().tolist(),counter)
 
@@ -646,14 +708,11 @@ class unic_grpo(Trainer):
                 loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
 
                 #log
-                if self.deepspeed_enabled:
-                    self.model.backward(loss)
-                    self.model.step()
-                else:
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                self.scheduler.step()
                 # if self.args.t2i_data and (epoch+1) % 10 == 0:
                 #     print('epoch',epoch+1,'loss',loss.item())
 
