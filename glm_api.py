@@ -28,7 +28,7 @@ def evaluate(image_urls):
     prompt="""
 **Act as a professional image quality and identity evaluation system. You will receive one reference image (the first one) followed by multiple generated images (others) for assessment. For each generated image, evaluate based on these criteria:**
 
-1.  **Structural Integrity and Reasonableness (40% weight):** Assess the inherent rationality of the generated image itself. For human faces: evaluate facial symmetry, proportional distribution of facial features, anatomical correctness, and natural appearance. For objects: evaluate structural coherence, physical plausibility, and absence of deformities or artifacts.
+1.  **Structural Integrity and Reasonableness (40% weight):** Assess the inherent rationality of the generated image itself. For human/animal faces: evaluate facial symmetry, proportional distribution of facial features, anatomical correctness, and natural appearance. For objects: evaluate structural coherence, physical plausibility, and absence of deformities or artifacts.
 
 2.  **Identity Faithfulness to Reference (60% weight):** Determine the degree to which the person/object in the generated image is the same as in the reference image. Consider facial features, distinctive characteristics, and overall likeness for persons; consider form, texture, and defining attributes for objects.
 
@@ -71,7 +71,7 @@ def glm_evaluate(image_paths):
     prompt="""
 **Act as a professional image quality and identity evaluation system. You will receive one reference image (the first one) followed by multiple generated images (others) for assessment. For each generated image, evaluate based on these criteria:**
 
-1.  **Structural Integrity and Reasonableness (40% weight):** Assess the inherent rationality of the generated image itself. For human faces: evaluate facial symmetry, proportional distribution of facial features, anatomical correctness, and natural appearance. For objects: evaluate structural coherence, physical plausibility, and absence of deformities or artifacts.
+1.  **Structural Integrity and Reasonableness (40% weight):** Assess the inherent rationality of the generated image itself. For human/animal faces: evaluate facial symmetry, proportional distribution of facial features, anatomical correctness, and natural appearance. For objects: evaluate structural coherence, physical plausibility, and absence of deformities or artifacts.
 
 2.  **Identity Faithfulness to Reference (60% weight):** Determine the degree to which the person/object in the generated image is the same as in the reference image. Consider facial features, distinctive characteristics, and overall likeness for persons; consider form, texture, and defining attributes for objects.
 
@@ -229,4 +229,5 @@ if __name__ == "__main__":
 
     # 获取回复
     print(response.choices[0].message.content)
+
 
