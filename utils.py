@@ -8,8 +8,9 @@ from pdata import image_transform
 import numpy as np
 from pathlib import Path
 import torch
+import torch.nn as nn
 import json
-import deepspeed
+# import deepspeed
 from datasets import Dataset, IterableDataset
 from packaging import version
 from models import Showo, MAGVITv2, get_mask_chedule
@@ -20,7 +21,31 @@ import re
 from typing import List, Any
 import logging
 from torch.distributed import get_rank
-from torch.serialization import safe_globals
+import torchvision.transforms as transforms
+from feat.identity_detectors.facenet.facenet_model import InceptionResnetV1
+from facenet_pytorch import MTCNN, InceptionResnetV1
+# from torch.serialization import safe_globals
+def get_image_files(directory):
+    image_extensions = {'.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG'}
+    image_files = []
+    
+    # 检查目录是否存在
+    if not os.path.exists(directory):
+        raise ValueError(f"目录不存在: {directory}")
+    if not os.path.isdir(directory):
+        raise ValueError(f"路径不是目录: {directory}")
+    
+    # 只遍历当前目录，不递归子文件夹
+    for file in os.listdir(directory):
+        file_path = os.path.join(directory, file)
+        # 只处理文件，忽略子文件夹
+        if os.path.isfile(file_path):
+            if any(file.lower().endswith(ext) for ext in image_extensions):
+                image_files.append(file_path)
+    
+    return image_files
+    
+    return image_files
 def mkdir(path):
     folder_path=Path(path)
     if not folder_path.exists():
@@ -56,30 +81,20 @@ def save_distributed_model(
     optimizer, 
     save_dir, 
     epoch=0, 
-    use_deepspeed=False
 ):
     from torch.distributed import get_rank
     if get_rank() == 0:
         os.makedirs(save_dir, exist_ok=True)
-
-        if use_deepspeed:
-            model.save_checkpoint(
-                save_dir=save_dir,
-                tag=f"epoch_{epoch}",
-                save_optimizer_states=True
-            )
-            print(f"[rank0] DeepSpeed模型保存至：{os.path.join(save_dir, f'epoch_{epoch}')}")
-        else:
-            # 核心修改：移除 pytorch_version 字段（避免保存TorchVersion类型）
-            save_data = {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict() if optimizer else None
-                # 删掉这行："pytorch_version": torch.__version__
-            }
-            save_path = os.path.join(save_dir, f"model_epoch{epoch}.pt")
-            torch.save(save_data, save_path)
-            print(f"[rank0] DDP模型保存至：{save_path}")
+        # 核心修改：移除 pytorch_version 字段（避免保存TorchVersion类型）
+        save_data = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict() if optimizer else None
+            # 删掉这行："pytorch_version": torch.__version__
+        }
+        save_path = os.path.join(save_dir, f"model_epoch{epoch}.pt")
+        torch.save(save_data, save_path)
+        print(f"[rank0] DDP模型保存至：{save_path}")
 
 
 
@@ -87,7 +102,6 @@ def load_distributed_model(
     model, 
     optimizer=None, 
     save_dir=None, 
-    use_deepspeed=False, 
     device="cuda"
 ):
     """
@@ -97,54 +111,31 @@ def load_distributed_model(
     if not os.path.exists(save_dir):
         raise FileNotFoundError(f"模型保存目录不存在：{save_dir}")
 
-    if use_deepspeed:
-        # ---------------------- DeepSpeed加载（不受weights_only影响） ----------------------
-        checkpoint_dirs = [
-            d for d in Path(save_dir).iterdir() 
-            if d.is_dir() and d.name.startswith("epoch_")
-        ]
-        if not checkpoint_dirs:
-            raise FileNotFoundError(f"{save_dir} 中无DeepSpeed checkpoint目录（需以epoch_开头）")
-        
-        latest_ckpt_dir = max(checkpoint_dirs, key=lambda x: int(x.name.split("_")[-1]))
-        print(f"[rank{get_rank()}] DeepSpeed加载最新目录：{latest_ckpt_dir}")
+    # ---------------------- 普通DDP加载（核心修复：处理weights_only问题） ----------------------
+    model_files = [
+        f for f in Path(save_dir).iterdir() 
+        if f.is_file() and f.name.startswith("model_epoch") and f.name.endswith(".pt")
+    ]
+    if not model_files:
+        raise FileNotFoundError(f"{save_dir} 中无DDP模型文件（需以model_epoch开头，.pt结尾）")
+    
+    latest_model_file = max(model_files, key=lambda x: int(x.name.split("_epoch")[-1].split(".")[0]))
+    print(f"[rank{get_rank()}] DDP加载最新文件：{latest_model_file}")
 
-        load_info = model.load_checkpoint(
-            load_dir=save_dir,
-            tag=latest_ckpt_dir.name,
-            load_optimizer_states=True
-        )
-        epoch = load_info["epoch"]
-        print(f"[rank{get_rank()}] DeepSpeed模型加载完成（epoch {epoch}）")
-
-    else:
-        # ---------------------- 普通DDP加载（核心修复：处理weights_only问题） ----------------------
-        model_files = [
-            f for f in Path(save_dir).iterdir() 
-            if f.is_file() and f.name.startswith("model_epoch") and f.name.endswith(".pt")
-        ]
-        if not model_files:
-            raise FileNotFoundError(f"{save_dir} 中无DDP模型文件（需以model_epoch开头，.pt结尾）")
-        
-        latest_model_file = max(model_files, key=lambda x: int(x.name.split("_epoch")[-1].split(".")[0]))
-        print(f"[rank{get_rank()}] DDP加载最新文件：{latest_model_file}")
-
-        # 关键修复：用safe_globals上下文允许加载torch.torch_version.TorchVersion
-        with safe_globals([torch.torch_version.TorchVersion]):
-            # 保持weights_only=True（安全模式），同时允许信任的类型
-            load_data = torch.load(
-                latest_model_file,
-                map_location=device,
-                weights_only=True  # 保留安全模式，仅允许信任类型
-            )
-        
-        # 加载模型参数（原始模型，后续DDP包装）
-        model.load_state_dict(load_data["model_state_dict"])
-        
-        # 恢复优化器
-        if optimizer and "optimizer_state_dict" in load_data and load_data["optimizer_state_dict"]:
-            optimizer.load_state_dict(load_data["optimizer_state_dict"])
-            print(f"[rank{get_rank()}] 优化器状态恢复完成")
+    # 关键修复：用safe_globals上下文允许加载torch.torch_version.TorchVersion
+    load_data = torch.load(
+        latest_model_file,
+        map_location=device,
+        weights_only=True
+    )
+    
+    # 加载模型参数（原始模型，后续DDP包装）
+    model.load_state_dict(load_data["model_state_dict"])
+    
+    # 恢复优化器
+    if optimizer and "optimizer_state_dict" in load_data and load_data["optimizer_state_dict"]:
+        optimizer.load_state_dict(load_data["optimizer_state_dict"])
+        print(f"[rank{get_rank()}] 优化器状态恢复完成")
         
         epoch = load_data["epoch"]
         print(f"[rank{get_rank()}] DDP模型加载完成（epoch {epoch}）")
@@ -152,9 +143,6 @@ def load_distributed_model(
     # 确保模型在目标设备
     model.to(device)
     return model, optimizer, epoch
-import torch
-# 需确保 safe_globals 函数已导入（若来自自定义工具库，需保留对应导入）
-# 示例导入（根据实际项目调整）：from your_project.utils import safe_globals
 
 def load_single_model_weights_from_file(
     model, 
@@ -167,15 +155,11 @@ def load_single_model_weights_from_file(
 
     # 2. 打印加载信息
     print(f"正在加载模型权重文件：{weight_file_path}")
-
-    # 3. 安全加载权重（适配PyTorch 2.6+ weights_only安全模式，避免恶意代码）
-    # safe_globals 上下文：允许加载 torch.torch_version.TorchVersion 合法类型
-    with safe_globals([torch.torch_version.TorchVersion]):
-        load_data = torch.load(
-            weight_file_path,
-            map_location=device,  # 加载时直接映射到目标设备，减少显存占用
-            weights_only=True     # 安全模式：仅加载权重数据，拒绝执行外部代码
-        )
+    load_data = torch.load(
+        weight_file_path,
+        map_location=device,
+        weights_only=True
+    )
 
     # 4. 验证权重文件核心结构（必须包含模型参数和轮次信息）
     required_keys = ["model_state_dict", "epoch"]
@@ -206,7 +190,7 @@ def calculate_distance(list1, list2):
     for a, b in zip(list1, list2):
         squared_diff_sum += (a - b) **2
     
-    return math.sqrt(squared_diff_sum)
+    return squared_diff_sum
 def calculate_bleu(reference, candidate):
     # 将字符串转换为字符列表（适用于中文）
     reference_tokens = list(reference)
@@ -429,3 +413,94 @@ def manage_top_images(image_path, score,  folder_path,top_n=30, counter_file="co
             json.dump(score_dict, f, indent=4)
     
     return should_add  # 返回是否成功添加了图片
+
+import face_recognition
+
+def face_recognition_score(generated_image_path,data_root,concept):
+    generated_image = face_recognition.load_image_file(generated_image_path)
+    generated_encoding = face_recognition.face_encodings(generated_image)[0]
+    path=os.path.join(data_root,'concept/train',concept)
+    paths=get_image_files(path)
+    scores=[]
+    for p in paths:
+        try:
+            known_image = face_recognition.load_image_file(p)
+            known_encoding = face_recognition.face_encodings(known_image)[0]
+            # 计算人脸距离（越小越相似）
+            distance = face_recognition.face_distance([known_encoding], generated_encoding)[0]
+            
+            # 将距离转换为0-100的分数（距离0→100分，距离0.6→0分）
+            max_distance = 1  # 默认阈值
+        except:
+            continue
+        if distance >= max_distance:
+            s=0.0
+        s = (1 - distance / max_distance)
+        if s<0.5:
+            s=0
+        else:
+            s=(s-0.5)*2
+        scores.append(s)
+    if len(scores)>0:
+        score=sum(scores)/len(scores)
+    else:
+        raise RuntimeError("facerecogition评分失败")
+    return score
+
+
+device = 'cuda:3'
+identity_detector = InceptionResnetV1(
+    pretrained=None,
+    classify=False,
+    num_classes=None,
+    dropout_prob=0.6,
+    device=device,
+)
+identity_detector.logits = nn.Linear(512, 8631)
+identity_model_file='./facenet_20180402_114759_vggface2.pth'
+identity_detector.load_state_dict(torch.load(identity_model_file, map_location=device))
+identity_detector.eval()
+identity_detector.to(device)
+
+
+mtcnn = MTCNN(
+    image_size=160,  # 对齐后的人脸尺寸（与 Facenet 输入匹配）
+    margin=32,       # 裁剪时的边缘余量
+    min_face_size=20,  # 最小可检测人脸尺寸
+    thresholds=[0.6, 0.7, 0.7],  # 三级网络的置信度阈值
+    factor=0.709,    # 图像金字塔缩放因子
+    post_process=True,  # 对齐后是否标准化
+    device=device  # 设备
+)
+
+def facenet_score(image_path1,data_root,concept):
+    img1 = Image.open(image_path1).convert('RGB')
+    face_tensor1 = mtcnn(img1)
+    with torch.no_grad():  # 关闭梯度计算，节省内存并加速
+        identity_embeddings1 = identity_detector(face_tensor1.unsqueeze(0).to(device))
+    path=os.path.join(data_root,'concept/train',concept)
+    paths=get_image_files(path)
+    scores=[]
+    for p in paths:
+        # print(p)
+        try:
+            img2 = Image.open(p).convert('RGB')
+            face_tensor2 = mtcnn(img2)
+            with torch.no_grad():
+                identity_embeddings2 = identity_detector(face_tensor2.unsqueeze(0).to(device))
+            # print(f"distance: {torch.norm(identity_embeddings1 - identity_embeddings2)}")
+            # distance=torch.norm(identity_embeddings1 - identity_embeddings2)
+            cos_sim = torch.nn.functional.cosine_similarity(identity_embeddings1, identity_embeddings2)  # 相似度
+            if cos_sim<0.5:
+                cos_sim=0
+            else:
+                cos_sim=2*(cos_sim-0.5)
+            s=cos_sim
+            scores.append(s)
+        except:
+            continue
+    if len(scores)>0:
+        score=sum(scores)/len(scores)
+    else:
+        raise RuntimeError("facenet评分失败")
+    return score
