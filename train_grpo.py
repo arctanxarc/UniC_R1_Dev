@@ -62,6 +62,7 @@ class GRPOScriptArguments(ScriptArguments):
     data_root:str=field(
         default="/share/project/emllm_mnt.1d/mnt/hpfs/baaiei/daigaole/code/UnicR1/dataset/unictokens_data"
     )
+    ablation_mode:str=field(default='ru',metadata={"help":"Chosen from: ur,ru,random"})
     inverse_prompt:bool=field(default=True)
     save_dir:str=field(default="./tmp_result/")
     work_dir:str=field(default="./")
