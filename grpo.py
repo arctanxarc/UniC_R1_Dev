@@ -151,7 +151,7 @@ class unic_grpo(Trainer):
             for _  in range(int(self.args.batch_num/2)):
                 self.mode.append('u')
         else:
-            for _ in range(len(self.args.batch_num)):
+            for _ in range(self.args.batch_num):
                 rand_seed=random.random()
                 modified_rate=int(self.args.batch_num/2)/self.args.batch_num
                 if rand_seed<=modified_rate:
