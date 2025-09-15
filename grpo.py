@@ -710,6 +710,69 @@ class unic_grpo(Trainer):
                 #log
                 self.optimizer.zero_grad()
                 loss.backward()
+                # ---------------------- 1. 梯度裁剪（防止梯度爆炸） ----------------------
+                # 注意：DDP 梯度同步后，所有进程梯度已一致，裁剪操作需在所有进程执行（确保参数更新一致）
+                max_norm = 1.0  # 梯度裁剪阈值（可根据模型调整，如 0.5/2.0）
+                torch.nn.utils.clip_grad_norm_(
+                    parameters=self.model.parameters(),  # 对 DDP 模型的所有可训练参数裁剪
+                    max_norm=max_norm,
+                    norm_type=2  # L2 范数（常用选择，也可根据需求用 L1）
+                )
+
+                # ---------------------- 2. 打印梯度均值（监控梯度健康度） ----------------------
+                # 仅在 local_rank=0 打印（避免所有进程重复输出，降低日志冗余）
+                if self.local_rank == 0:
+                    # 统计所有可训练参数的梯度均值（过滤无梯度的参数，如冻结的视觉 encoder）
+                    grad_means = []
+                    for name, param in self.model.named_parameters():
+                        if param.requires_grad:
+                            # 计算当前参数的梯度均值（绝对值，避免正负抵消）
+                            grad_mean = param.grad.abs().mean().item()
+                            grad_means.append(grad_mean)
+                            # 可选：打印关键参数的梯度（如 LLM 嵌入层、注意力层，定位异常梯度）
+                            if any(keyword in name for keyword in ["embed", "attention", "mlp"]):
+                                logging.info(f"Gradient - {name}: mean={grad_mean:.6f}")
+                    
+                    # 打印全局梯度均值（反映整体梯度规模）
+                    global_grad_mean = sum(grad_means) / len(grad_means) if grad_means else 0.0
+                    logging.info(f"Epoch {epoch}, Batch {batch_idx}: Global gradient mean={global_grad_mean:.6f}")
+
+                # ---------------------- 3. 验证各进程模型参数一致性（确保 DDP 同步正常） ----------------------
+                # 每 10 个 batch 验证一次（避免频繁验证影响性能，可调整频率）
+                if batch_idx % 1 == 0:
+                    # 选择一个关键参数作为"校验锚点"（如 LLM 嵌入层权重，确保所有进程该参数一致）
+                    anchor_param_name = "showo.get_input_embeddings().weight"  # 对应 Showo 模型的嵌入层
+                    try:
+                        # 1. 获取当前进程的锚点参数值（DDP 模型需通过 .module 访问原始参数）
+                        if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+                            anchor_param = getattr(self.model.module, "showo").get_input_embeddings().weight
+                        else:
+                            anchor_param = getattr(self.model, "showo").get_input_embeddings().weight
+                        
+                        # 2. 计算当前进程锚点参数的均值（用于跨进程对比）
+                        local_param_mean = anchor_param.mean().item()
+                        local_param_mean_tensor = torch.tensor(local_param_mean, device=self.args.device)
+                        
+                        # 3. 收集所有进程的参数均值（通过 all_gather 同步）
+                        all_param_means = [torch.tensor(0.0, device=self.args.device) for _ in range(self.world_size)]
+                        torch.distributed.all_gather(all_param_means, local_param_mean_tensor)
+                        
+                        # 4. 验证所有进程的均值是否一致（误差阈值设为 1e-6，适应浮点精度）
+                        param_means = [mean.item() for mean in all_param_means]
+                        is_consistent = all(abs(mean - param_means[0]) < 1e-6 for mean in param_means)
+                        
+                        # 5. 打印验证结果（仅 local_rank=0 输出，避免冗余）
+                        if self.local_rank == 0:
+                            if is_consistent:
+                                logging.info(f"Parameter consistency check PASSED: All ranks have same mean={param_means[0]:.6f}")
+                            else:
+                                # 若不一致，打印各进程均值（定位异常进程）
+                                logging.error(f"Parameter consistency check FAILED: Ranks' means={param_means}")
+                    except Exception as e:
+                        # 捕获参数访问异常（如参数名错误），避免训练中断
+                        if self.local_rank == 0:
+                            logging.error(f"Parameter consistency check ERROR: {str(e)}")
+                ref_model_test=self.ref_model.check_param_change()
                 self.optimizer.step()
                 self.optimizer.zero_grad()
                 self.scheduler.step()
