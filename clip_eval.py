@@ -20,7 +20,7 @@ class CLIPEvaluator(object):
             # preprocess = clip._transform(model.input_resolution)
             # self.model=model
             # self.model = torch.jit.load(pretrained, map_location=device).eval()
-        # ªÒ»°‘≠ ºCLIP‘§¥¶¿Ì
+        # Ëé∑ÂèñÂéüÂßãCLIPÈ¢ÑÂ§ÑÁêÜ
             # _, clip_preprocess = clip.load(clip_model, device=device, jit=False)
             
             # self.model.load_state_dict(state_dict)
@@ -216,5 +216,6 @@ if __name__ == '__main__':
     model.print_avg_results()
     # avg_sim = sum(sims) / len(sims)
     # print(f"Average Similarity: {avg_sim}")
+    
     
     
