@@ -5,7 +5,7 @@ import numpy as np
 import json
 from PIL import Image
 from torchvision import transforms
-
+# from utils import check_dtype
 
 class CLIPEvaluator(object):
     def __init__(self, device, clip_model='ViT-B/32',pretrained=None) -> None:
@@ -87,6 +87,7 @@ class SHOWO_P_CLIPEvaluator(CLIPEvaluator):
                  data_root='/home/daigaole/code/ex/dataset/unictokens_data/',
                  work_dir='/home/daigaole/code/ex/showo_feat',
                  save_dir='0.png',
+                 dtype=None,
                  resized_size=512) -> None:
         # os.environ['OPEN_CLIP_NO_NETWORK'] = '1'
         super().__init__(device,pretrained=clip_model)
@@ -95,6 +96,7 @@ class SHOWO_P_CLIPEvaluator(CLIPEvaluator):
         self.results = {}
         self.resized_size = resized_size
         self.save_dir=save_dir
+        # self.model=check_dtype(self.model,dtype)
         
     def image_transform(self, image):
         image = transforms.Resize(self.resized_size, interpolation=transforms.InterpolationMode.BICUBIC)(image)
