@@ -62,7 +62,7 @@ class GRPOScriptArguments(ScriptArguments):
     data_root:str=field(
         default="/share/project/emllm_mnt.1d/mnt/hpfs/baaiei/daigaole/code/UnicR1/dataset/unictokens_data"
     )
-    ablation_mode:str=field(default='ru',metadata={"help":"Chosen from: ur,ru,random"})
+    ablation_mode:str=field(default='random',metadata={"help":"Chosen from: ur,ru,random"})
     inverse_prompt:bool=field(default=True)
     save_dir:str=field(default="./tmp_result/")
     work_dir:str=field(default="./")
@@ -100,7 +100,7 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Number of epochs between evaluations"}
     )
     epoch: int = field(
-        default=15,
+        default=4,
         metadata={"help": "Total number of training epochs"}
     )
     epoch_to_load: int = field(
@@ -108,7 +108,7 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Epoch to load from the checkpoint"}
     )
     lr: float = field(
-        default=1e-7,
+        default=1e-6,
         metadata={"help": "Learning rate"}
     )
     nums_new_token_i_stage_1: int = field(
@@ -483,3 +483,4 @@ if __name__ == "__main__":
     parser = TrlParser((GRPOScriptArguments, GrpoConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
     main(script_args, training_args, model_args)
+
