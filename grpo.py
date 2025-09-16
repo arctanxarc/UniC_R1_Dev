@@ -82,7 +82,6 @@ Do not miss objects. Output your visualization directly without explanation:
 '''
 
 
-
 # '/home/daigaole/code/ex/dataset/unictokens_data/concept/train/adrien_brody/3.png'
 
 class unic_grpo(Trainer):
@@ -100,6 +99,26 @@ class unic_grpo(Trainer):
         peft_config,
         attn_implementation
     ):
+        self.local_rank = local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self.args=args
+        if self.local_rank == 0:
+            self.target_dtype = torch.float32
+        else:
+            self.target_dtype = torch.float32  # 临时占位
+        
+        # 广播target_dtype到所有进程（用整数标识：0=fp32,1=fp16,2=bf16）
+        if dist.is_initialized():
+            dtype_code = torch.tensor(
+                2 if self.target_dtype == torch.float32 else 1 if self.target_dtype == torch.float16 else 0,
+                device=self.args.device
+            )
+            dist.broadcast(dtype_code, src=0)
+            # 非0进程更新target_dtype
+            if self.local_rank != 0:
+                code = dtype_code.item()
+                self.target_dtype = torch.float32 if code == 2 else torch.float16 if code == 1 else torch.float32
+        logging.info(f"进程 {self.local_rank} 最终target_dtype: {self.target_dtype}")
 
         # freeze all vision encoders
         for name, param in model.named_parameters():
@@ -108,10 +127,10 @@ class unic_grpo(Trainer):
         for name, param in vq_model.named_parameters():
             param.requires_grad = False
 
-        self.local_rank = local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        
         # # Reference model
-        self.model=model
+        self.model=model.to(self.target_dtype)
+        self.model=check_dtype(model,self.target_dtype)
         self.optimizer=optimizer
         num_training_steps = args.batch_num * args.epoch
         num_warmup_steps = args.batch_num  # 10%的热身步数
@@ -128,15 +147,17 @@ class unic_grpo(Trainer):
         self.beta = train_args.beta
         self._metrics = defaultdict(list)
         self.model_accepts_loss_kwargs = False
-        self.args=args
         self.config=config
+        
         self.vq_model=vq_model
+        self.vq_model=check_dtype(self.vq_model,self.target_dtype)
         self.uni_prompting=uni_prompting
         self.tokenizer=tokenizer
         self.beta=0.01
         self.rate=0.5
         self.split_rate=0.5
         self.ref_model=ref_model(self.args)
+        self.ref_model.model=check_dtype(self.ref_model.model,self.target_dtype)
         self.info=read_json_to_dict(os.path.join(self.args.data_root,'concept/train',self.args.concept,'info.json'))
         self.t2i_condition=read_json_to_dict(os.path.join(self.args.data_root,'concept/test',self.args.concept,'t2i_conditions.json'))
         self.vqa=read_json_to_dict(os.path.join(self.args.data_root,'concept/train',self.args.concept,'conversations.json'))
@@ -246,6 +267,7 @@ class unic_grpo(Trainer):
                         image_tokens_mmu = self.vq_model.get_code(image)
                         image_tokens = image_tokens_mmu + len(self.uni_prompting.text_tokenizer)
                         us_input = self.uni_prompting.text_tokenizer(['USER: ' + us_prompt + ' ASSISTANT:'])['input_ids']
+
                         us_input = torch.tensor(us_input).to(self.args.device)
                         us_input = torch.cat([
                             (torch.ones(us_input.shape[0], 1) * self.uni_prompting.sptids_dict['<|mmu|>']).to(self.args.device),
@@ -256,7 +278,8 @@ class unic_grpo(Trainer):
                             us_input
                         ], dim=1).long()
                         us_mask = create_attention_mask_for_mmu(us_input.to(self.args.device),
-                                                    eoi_id=int(self.uni_prompting.sptids_dict['<|eoi|>']))
+                                                    eoi_id=int(self.uni_prompting.sptids_dict['<|eoi|>'])).to(self.target_dtype)
+                        us_mask = us_mask.type(self.target_dtype)
                         us_toks_list = self.model.mmu_generate(
                             us_input, 
                             attention_mask=us_mask,
@@ -319,9 +342,8 @@ class unic_grpo(Trainer):
                         image = image_transform(image_ori, resolution = self.config.dataset.params.resolution).to(self.args.device)
                         image = image.unsqueeze(0)
 
-
                         image_tokens_mmu = self.vq_model.get_code(image)
-                        image_tokens = image_tokens_mmu + len(self.uni_prompting.text_tokenizer)
+                        image_tokens = (image_tokens_mmu + len(self.uni_prompting.text_tokenizer)).long()
                         us_input = self.uni_prompting.text_tokenizer(['USER: ' + us_prompt + ' ASSISTANT:'])['input_ids']
                         us_input = torch.tensor(us_input).to(self.args.device)
                         us_input = torch.cat([
@@ -333,7 +355,8 @@ class unic_grpo(Trainer):
                             us_input
                         ], dim=1).long()
                         us_mask = create_attention_mask_for_mmu(us_input.to(self.args.device),
-                                                    eoi_id=int(self.uni_prompting.sptids_dict['<|eoi|>']))
+                                                    eoi_id=int(self.uni_prompting.sptids_dict['<|eoi|>'])).to(self.target_dtype)
+                        us_mask = us_mask.type(self.target_dtype)
                         us_toks_list = self.model.mmu_generate(
                             us_input, 
                             attention_mask=us_mask,
@@ -367,12 +390,15 @@ class unic_grpo(Trainer):
                         condition+=self.info['info']+more_prompt
                         conditions = [condition] * batch_size_t2i
 
-                    ref_logits=self.ref_model.reference(condition,epoch,batch_idx,self.local_rank,group_id).to(self.args.device)
+                    ref_logits=self.ref_model.reference(condition,epoch,batch_idx,self.local_rank,group_id).to(self.args.device, dtype=self.target_dtype)
+                    ref_logits = torch.clamp(ref_logits, min=1e-10, max=1e10)
                     global_ref_logits.append(ref_logits)
 
 
                     del image_tokens
                     input_ids_infer, _ = self.uni_prompting((conditions, image_tokens_infer), 't2i_gen')   # [1, 387]
+                    input_ids_infer = input_ids_infer.to(dtype=torch.long, device=self.args.device)
+                    check_embedding_dtype(self.model,input_ids_infer[:1], self.target_dtype)
                     if self.config.guidance_scale > 0:
                         uncond_input_ids, _ = self.uni_prompting(([''] * batch_size_t2i, image_tokens_infer), 't2i_gen')
                     # [1, 387], == [PAD] * 126 + <|t2i|> + <|endoftext|> + <|endoftext|> + <|soi|> + [MASK] * 256 + <|eoi|> ## no prompt
@@ -380,13 +406,15 @@ class unic_grpo(Trainer):
                                                                             pad_id=int(self.uni_prompting.sptids_dict['<|pad|>']),
                                                                             soi_id=int(self.uni_prompting.sptids_dict['<|soi|>']),
                                                                             eoi_id=int(self.uni_prompting.sptids_dict['<|eoi|>']),
-                                                                            rm_pad_in_image=True)
+                                                                            rm_pad_in_image=True).to(self.target_dtype)
+                        attention_mask1 = attention_mask1.type(self.target_dtype)
                     else:
                         attention_mask1 = create_attention_mask_predict_next(input_ids_infer,
                                                                             pad_id=int(self.uni_prompting.sptids_dict['<|pad|>']),
                                                                             soi_id=int(self.uni_prompting.sptids_dict['<|soi|>']),
                                                                             eoi_id=int(self.uni_prompting.sptids_dict['<|eoi|>']),
-                                                                            rm_pad_in_image=True)
+                                                                            rm_pad_in_image=True).to(self.target_dtype)
+                        attention_mask1 = attention_mask1.type(self.target_dtype)
                         uncond_input_ids = None
                     if self.config.get("mask_schedule", None) is not None:
                         schedule = self.config.mask_schedule.schedule
@@ -416,6 +444,7 @@ class unic_grpo(Trainer):
                         config=self.config,
                         return_logits=True,
                     )
+                    logits = torch.clamp(logits, min=1e-10, max=1e10)
                     local_gen_token_ids = gen_token_ids#[self.local_rank::self.world_size]
                     local_logits = logits#[self.local_rank::self.world_size]
                     global_id.append(local_gen_token_ids)
@@ -506,7 +535,8 @@ class unic_grpo(Trainer):
                     clip_model=os.path.join(self.args.work_dir,'ViT-B-32.pt'),
                     data_root=self.args.data_root,
                     work_dir=self.args.work_dir,
-                    save_dir=fm
+                    save_dir=fm,
+                    dtype=self.target_dtype
                 )
                 for path in path_list:
                     if 'man' in self.info['class'].lower():
@@ -548,7 +578,7 @@ class unic_grpo(Trainer):
                         reward2_list.append(sim)
                 # print('score',sum(reward2_list)/len(reward2_list))
                 print('similarity',path,sim)
-                rewards2=torch.tensor(reward2_list).float().reshape(self.group).to(self.args.device)
+                rewards2=torch.tensor(reward2_list).float().reshape(self.group).to(self.args.device,self.target_dtype)
                 
 
                 #gpt-4o reward
@@ -602,12 +632,12 @@ class unic_grpo(Trainer):
                         mean_re3=sum(reward3_list)/len(reward3_list)
                         diff=mean_re3-0.8
                         reward3_list=[i-diff for i in reward3_list]
-                        rewards3 = torch.tensor(reward3_list, dtype=torch.float32, device=self.args.device)
+                        rewards3 = torch.tensor(reward3_list, dtype=self.target_dtype, device=self.args.device)
                         signal=0
                     else:
                         # 其他进程初始化空tensor（用于接收广播结果）
                         # 注意：需提前知道rewards3的形状，假设长度为self.group
-                        rewards3 = torch.tensor([0.8 for _ in range(self.group*self.num_generations)], dtype=torch.float32, device=self.args.device)
+                        rewards3 = torch.tensor([0.8 for _ in range(self.group*self.num_generations)], dtype=self.target_dtype, device=self.args.device)
 
                 except Exception as e:
                     print(f'[local_rank={self.local_rank}] 评分计算失败，使用默认rewards2: {e}')
@@ -630,14 +660,14 @@ class unic_grpo(Trainer):
                     indices = [i for i in range(total_length) if i % world_size == self.local_rank]
 
                     # 提取当前进程的reward
-                    my_rewards3 = rewards3[indices].reshape(-1)
+                    my_rewards3 = rewards3[indices].reshape(-1).to(self.target_dtype)
 
                     # 4. 与rewards2合成（当前进程仅用自己的reward片段）
 
                     rewards = rewards2 * 0.4 + my_rewards3 * 0.6
                 else:
                     rewards=rewards2
-                reward_text=torch.tensor(reward_text).float().reshape(self.group).to(self.args.device)
+                reward_text=torch.tensor(reward_text).float().reshape(self.group).to(self.args.device,self.target_dtype)
                 rewards=rewards*0.65+reward_text*0.35
                 counter+=1
                 # update_best_results(path_list,rewards.cpu().detach().numpy().tolist(),counter)
