@@ -46,6 +46,26 @@ def get_image_files(directory):
     return image_files
     
     return image_files
+
+def check_embedding_dtype(model, input_ids, target_dtype):
+    # 获取嵌入层
+    embed_layer = model.showo.get_input_embeddings()
+    # 生成嵌入向量并检查dtype
+    embed_output = embed_layer(input_ids)
+    assert embed_output.dtype == target_dtype, \
+        f"嵌入层输出精度错误：期望 {target_dtype}，实际 {embed_output.dtype}"
+    logging.debug("嵌入层输出精度验证通过")
+def check_dtype(original_model,target_dtype):
+    for name, param in original_model.named_parameters():
+        if name.startswith("vision_model") or name.startswith("aligner") or name.startswith("gen"):
+            if param.dtype != target_dtype:
+                param.data = param.data.to(target_dtype)
+                logging.warning(f"冻结层 {name} 精度不匹配，已强制转换为 {target_dtype}")
+    for name, buf in original_model.named_buffers():
+        if buf.dtype.is_floating_point:
+            if buf.dtype != target_dtype:
+                buf.data = buf.data.to(target_dtype)
+    return original_model
 def mkdir(path):
     folder_path=Path(path)
     if not folder_path.exists():
@@ -504,3 +524,5 @@ def facenet_score(image_path1,data_root,concept):
     else:
         raise RuntimeError("facenet评分失败")
     return score
+    # print(f"cosine distance",cos_dist)
+# print(face_recognition_score('/share/project/emllm_mnt.1d/mnt/hpfs/baaiei/daigaole/code/UnicR1/showo/ref_image/adrien_brody/E0B4R0G1N0.png','/share/project/emllm_mnt.1d/mnt/hpfs/baaiei/daigaole/code/UnicR1/dataset/unictokens_data','adrien_brody'))
