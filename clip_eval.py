@@ -5,7 +5,7 @@ import numpy as np
 import json
 from PIL import Image
 from torchvision import transforms
-# from utils import check_dtype
+from utils import check_dtype
 
 class CLIPEvaluator(object):
     def __init__(self, device, clip_model='ViT-B/32',pretrained=None) -> None:
@@ -96,7 +96,7 @@ class SHOWO_P_CLIPEvaluator(CLIPEvaluator):
         self.results = {}
         self.resized_size = resized_size
         self.save_dir=save_dir
-        # self.model=check_dtype(self.model,dtype)
+        self.model=check_dtype(self.model,dtype)
         
     def image_transform(self, image):
         image = transforms.Resize(self.resized_size, interpolation=transforms.InterpolationMode.BICUBIC)(image)
@@ -218,6 +218,7 @@ if __name__ == '__main__':
     model.print_avg_results()
     # avg_sim = sum(sims) / len(sims)
     # print(f"Average Similarity: {avg_sim}")
+    
     
     
     
