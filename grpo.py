@@ -825,4 +825,4 @@ class unic_grpo(Trainer):
                 gc.collect()
                 torch.cuda.empty_cache()
             if epoch%self.args.interval_epochs==0 and epoch>0:
-                save_distributed_model(self.model,self.optimizer,os.path.join(self.args.save_dir,self.args.concept,'model_weights'),epoch=epoch)
+                save_distributed_model(self.model,self.optimizer,os.path.join(self.args.save_dir,'model_weights',self.args.concept,'model_weights'),epoch=epoch)
