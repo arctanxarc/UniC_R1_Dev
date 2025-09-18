@@ -58,13 +58,15 @@ class GRPOScriptArguments(ScriptArguments):
     """
     Script arguments for the GRPO training script.
     """
+    semantic:str=field(default=True)
     llm:str=field(default='glm')
+    accelerate:str=field(default=True)
     data_root:str=field(
         default="/share/project/emllm_mnt.1d/mnt/hpfs/baaiei/daigaole/code/UnicR1/dataset/unictokens_data"
     )
     ablation_mode:str=field(default='random',metadata={"help":"Chosen from: ur,ru,random"})
     inverse_prompt:bool=field(default=True)
-    save_dir:str=field(default="./tmp_result/")
+    save_dir:str=field(default="./tmp_result_accelerate/")
     work_dir:str=field(default="./")
     batch_num:int=field(default=10)
     batch_size:int=field(default=1)
@@ -80,7 +82,7 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Path to the configuration file"}
     )
     concept: str = field(
-        default="adrien_brody",
+        default="emma",
         metadata={"help": "Concept for the model"}
     )
     pre_trained_ckpt_name: str = field(
@@ -100,7 +102,7 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Number of epochs between evaluations"}
     )
     epoch: int = field(
-        default=4,
+        default=7,
         metadata={"help": "Total number of training epochs"}
     )
     epoch_to_load: int = field(
@@ -108,7 +110,7 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Epoch to load from the checkpoint"}
     )
     lr: float = field(
-        default=1e-6,
+        default=2e-6,
         metadata={"help": "Learning rate"}
     )
     nums_new_token_i_stage_1: int = field(
