@@ -377,7 +377,7 @@ class unic_grpo(Trainer):
                                 more_prompt=''
                             logging.info(f"After extraction:{more_prompt}")
                             condition+=self.info['info']+more_prompt
-                            conditions = [condition] * batch_size_t2i
+                            
                         else:
                             _,self.GT_IMAGE_PATH,SELECT_NUM=get_image_path(self.concept_train_path)
                             key=''
@@ -452,14 +452,13 @@ class unic_grpo(Trainer):
                                 more_prompt=''
                             logging.info(f"After extraction:{more_prompt}")
                             condition+=self.info['info']+more_prompt
-                            conditions = [condition] * batch_size_t2i
-
+                    
+                    conditions = [condition] * batch_size_t2i
                     ref_logits=self.ref_model.reference(condition,epoch,batch_idx,self.local_rank,group_id).to(self.args.device, dtype=self.target_dtype)
                     ref_logits = torch.clamp(ref_logits, min=1e-10, max=1e10)
                     global_ref_logits.append(ref_logits)
 
 
-                    del image_tokens
                     input_ids_infer, _ = self.uni_prompting((conditions, image_tokens_infer), 't2i_gen')   # [1, 387]
                     input_ids_infer = input_ids_infer.to(dtype=torch.long, device=self.args.device)
                     check_embedding_dtype(self.model,input_ids_infer[:1], self.target_dtype)
@@ -979,17 +978,18 @@ class unic_grpo(Trainer):
                 if dist.get_rank() == 0:
                     loss_list.append(avg_loss)
                     logging.info(f"{batch_idx} loss: {avg_loss:.4f}")
-                accounter_tensor = torch.tensor([accounter], dtype=torch.int64, device=self.args.device)
-                dist.all_reduce(accounter_tensor, op=dist.ReduceOp.SUM)
-                rr=(self.num_generations*self.group)/(accounter_tensor.item())
-                rrr=self.accelerate_rate-rr
-                delta=0.12*rrr
-                tmp_threshold=self.threshold**(1+delta)
-                if tmp_threshold-self.threshold>0.01:
-                    self.threshold+=1
-                if tmp_threshold-self.threshold<-0.01:
-                    self.threshold-=1
-                logging.info(f"threshold turns into {self.threshold}")
+                if self.args.accelerate:
+                    accounter_tensor = torch.tensor([accounter], dtype=torch.int64, device=self.args.device)
+                    dist.all_reduce(accounter_tensor, op=dist.ReduceOp.SUM)
+                    rr=(self.num_generations*self.group)/(accounter_tensor.item())
+                    rrr=self.accelerate_rate-rr
+                    delta=0.12*rrr
+                    tmp_threshold=self.threshold**(1+delta)
+                    if tmp_threshold-self.threshold>0.01:
+                        self.threshold+=1
+                    if tmp_threshold-self.threshold<-0.01:
+                        self.threshold-=1
+                    logging.info(f"threshold turns into {self.threshold}")
                 # for (n1, p1), (n2, p2) in zip(self.model.named_parameters(), self.ref_model.named_parameters()):
                 #     if torch.allclose(p1, p2)!=True:
                 #         print(f"parameter {n1} is not equal")
