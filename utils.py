@@ -25,6 +25,13 @@ import torchvision.transforms as transforms
 from feat.identity_detectors.facenet.facenet_model import InceptionResnetV1
 from facenet_pytorch import MTCNN, InceptionResnetV1
 # from torch.serialization import safe_globals
+def remove_token(raw_str):
+    pattern = r'<token_\d+>'
+
+    # 替换为空字符串（去除匹配的标签）
+    cleaned_str = re.sub(pattern, "", raw_str)
+
+    return cleaned_str
 def get_image_files(directory):
     image_extensions = {'.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG'}
     image_files = []
@@ -66,10 +73,21 @@ def check_dtype(original_model,target_dtype):
             if buf.dtype != target_dtype:
                 buf.data = buf.data.to(target_dtype)
     return original_model
+from pathlib import Path
+import os
+
 def mkdir(path):
-    folder_path=Path(path)
+    folder_path = Path(path)
+    # 1. 若路径不存在：直接创建文件夹（含父目录）
     if not folder_path.exists():
-        folder_path.mkdir(parents=True)
+        folder_path.mkdir(parents=True, exist_ok=False)  # exist_ok=False 确保只创建不存在的路径
+    # 2. 若路径存在，但不是文件夹（是文件）：先删除文件，再创建文件夹
+    elif not folder_path.is_dir():
+        os.remove(folder_path)  # 删除同名文件
+        folder_path.mkdir(parents=True, exist_ok=False)  # 重新创建文件夹
+    # 3. 若路径存在且是文件夹：直接跳过（无需操作）
+    else:
+        pass  # 文件夹已存在，无需处理
 def read_json_to_dict(file_path):
     """
     读取JSON文件并转换为字典
