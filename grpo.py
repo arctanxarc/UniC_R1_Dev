@@ -148,13 +148,15 @@ class unic_grpo(Trainer):
         self._metrics = defaultdict(list)
         self.model_accepts_loss_kwargs = False
         self.config=config
-        
+        self.threshold=0.55
+        self.accelerate_rate=0.25
         self.vq_model=vq_model
         self.vq_model=check_dtype(self.vq_model,self.target_dtype)
         self.uni_prompting=uni_prompting
         self.tokenizer=tokenizer
         self.beta=0.01
         self.rate=0.5
+        self.epsilon=0.2
         self.split_rate=0.5
         self.ref_model=ref_model(self.args)
         self.ref_model.model=check_dtype(self.ref_model.model,self.target_dtype)
@@ -197,6 +199,23 @@ class unic_grpo(Trainer):
 
     def train(self,return_outputs=False, num_items_in_batch=None):
         counter=0
+        loss_final=[]
+        accelerate_counter=0
+        fm=''
+        for f in ['0.png','0.jpg','0.jpeg']:
+            ref_path = os.path.join(self.args.data_root,'concept/train',self.args.concept,f)
+            if Path(ref_path).exists():
+                fm=f
+                break
+        clip_model=SHOWO_P_CLIPEvaluator(
+                # "cuda:3",
+                self.local_rank,
+                clip_model=os.path.join(self.args.work_dir,'ViT-B-32.pt'),
+                data_root=self.args.data_root,
+                work_dir=self.args.work_dir,
+                save_dir=fm,
+                dtype=self.target_dtype
+            )
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
         # other setting
@@ -212,7 +231,7 @@ class unic_grpo(Trainer):
             loss_list = []
             counter=0
             for batch_idx in tqdm(range(self.args.batch_num)):
-            # for _ in range(100):
+                accounter=0
                 torch.cuda.empty_cache()
                 batch_size_t2i = self.args.batch_size
 
@@ -231,6 +250,7 @@ class unic_grpo(Trainer):
                 global_id=[]
                 reward_text=[]
                 for group_id in range(self.group):
+
                     logging.info(f"gpu {self.local_rank},number {group_id}")
                     mti=self.model.config.mask_token_id
                     self.model.config.mask_token_id = self.model.showo.get_input_embeddings().num_embeddings - 1
@@ -244,151 +264,195 @@ class unic_grpo(Trainer):
                     for token in new_tokens_stage_2:
                         condition+=token
                     condition+=f'<{self.args.concept}>.\n'
-                    if self.mode[batch_idx]=='r':
-                        # us_prompt="what is in the image?"
-                        # us_prompt="Describe the person in this image using 3-5 concise descriptive adjectives focused on appearance, expression, and demeanor.Do not output extra information except these adjectives."
-                        r=random.randint(1,int((len(self.t2i_condition["personalized_driven_generation"])+1)*self.rate))
-                        self.r=r
-                        question=self.t2i_condition["personalized_driven_generation"][r-1]
-                        us_prompt=f'''
-                        Below is some information about <{self.args.concept}> : {self.info['extra_info']}
-                        Please make inferences based on the following prompt: {question}. 
-                        If the prompt relates to a specific item from the aforementioned information list, 
-                        output and only output that exact item. 
-                        If the prompt does not relate to any item in the list, 
-                        output nothing (i.e., an empty response).
-                        '''
-                        image_ori = Image.open(self.BLACK_IMAGE_PATH).convert("RGB")
-                        # tranforming the image to the required resolution
-                        image = image_transform(image_ori, resolution = self.config.dataset.params.resolution).to(self.args.device)
-                        image = image.unsqueeze(0)
+                    if self.args.semantic:
+                        if self.mode[batch_idx]=='r':
+                            # us_prompt="what is in the image?"
+                            # us_prompt="Describe the person in this image using 3-5 concise descriptive adjectives focused on appearance, expression, and demeanor.Do not output extra information except these adjectives."
+                            r=random.randint(1,int((len(self.t2i_condition["personalized_driven_generation"])+1)*self.rate))
+                            self.r=r
+                            question=self.t2i_condition["personalized_driven_generation"][r-1]
+                            separator = f"<{self.args.concept}>"
+
+                            # 分割字符串（split返回列表，最多分割1次，确保只分前后两部分）
+                            parts = question.split(separator, 1)  # split(sep, maxsplit=1)
+
+                            # 提取前后内容（处理分割失败的边缘情况，如分隔符不存在）
+                            if len(parts) == 2:
+                                before = parts[0].strip()  # 前半部分（strip()可选：去除前后多余空格）
+                                after = parts[1].strip()   # 后半部分
+                            else:
+                                before = question  # 若没有分隔符，前半部分为原字符串
+                                after = ""             # 后半部分为空
+                            condition=before+' '
+                            for token in new_tokens_stage_1:
+                                condition+=token
+                            for token in new_tokens_stage_2:
+                                condition+=token
+                            condition=condition+f'<{self.args.concept}> '+after+'.'
+                            us_prompt=f'''
+                            Below is some information about <{self.args.concept}> : {self.info['extra_info']}
+                            Please make inferences based on the following prompt: {question}. 
+                            If the prompt relates to a specific item from the aforementioned information list, 
+                            output and only output that exact item. 
+                            If the prompt does not relate to any item in the list, 
+                            output nothing (i.e., an empty response).
+                            '''
+                            image_ori = Image.open(self.BLACK_IMAGE_PATH).convert("RGB")
+                            # tranforming the image to the required resolution
+                            image = image_transform(image_ori, resolution = self.config.dataset.params.resolution).to(self.args.device)
+                            image = image.unsqueeze(0)
 
 
-                        image_tokens_mmu = self.vq_model.get_code(image)
-                        image_tokens = image_tokens_mmu + len(self.uni_prompting.text_tokenizer)
-                        us_input = self.uni_prompting.text_tokenizer(['USER: ' + us_prompt + ' ASSISTANT:'])['input_ids']
+                            image_tokens_mmu = self.vq_model.get_code(image)
+                            image_tokens = image_tokens_mmu + len(self.uni_prompting.text_tokenizer)
+                            us_input = self.uni_prompting.text_tokenizer(['USER: ' + us_prompt + ' ASSISTANT:'])['input_ids']
 
-                        us_input = torch.tensor(us_input).to(self.args.device)
-                        us_input = torch.cat([
-                            (torch.ones(us_input.shape[0], 1) * self.uni_prompting.sptids_dict['<|mmu|>']).to(self.args.device),
-                            (torch.ones(us_input.shape[0], 1) * self.uni_prompting.sptids_dict['<|soi|>']).to(self.args.device),
-                            image_tokens,
-                            (torch.ones(us_input.shape[0], 1) * self.uni_prompting.sptids_dict['<|eoi|>']).to(self.args.device),
-                            (torch.ones(us_input.shape[0], 1) * self.uni_prompting.sptids_dict['<|sot|>']).to(self.args.device),
-                            us_input
-                        ], dim=1).long()
-                        us_mask = create_attention_mask_for_mmu(us_input.to(self.args.device),
-                                                    eoi_id=int(self.uni_prompting.sptids_dict['<|eoi|>'])).to(self.target_dtype)
-                        us_mask = us_mask.type(self.target_dtype)
-                        us_toks_list = self.model.mmu_generate(
-                            us_input, 
-                            attention_mask=us_mask,
-                            top_k=5,
-                            eot_token=self.uni_prompting.sptids_dict['<|eot|>'],
-                        )
-                        us_toks_list= torch.stack(us_toks_list).squeeze()[None]
-                        more_prompt = self.uni_prompting.text_tokenizer.batch_decode(us_toks_list, skip_special_tokens=True)[0].strip()
-                        
-                        logging.info(f"Question:{question}")
-                        logging.info(f"Answer:{more_prompt}")
-                        text_score=[]
-                        text_gt=[0 for _ in range(len(self.info['extra_info']))]
-                        text_gt[r-1]=1
-                        for r in range(len(self.info['extra_info'])):
-                            text_score.append(calculate_bleu(self.info['extra_info'][r],more_prompt))
-                        text_mean=sum(text_score)
-                        t_score=[0]*len(self.info['extra_info'])
-                        if text_mean>0:
-                            t_score=[t/text_mean for t in text_score]
-                        print('gtscore',text_gt,text_mean)
-                        print('bleuscore',t_score)
-                        final_score=(2.0-calculate_distance(text_gt,t_score))/2
-                        if final_score<=0.5:
-                            final_score=0
+                            us_input = torch.tensor(us_input).to(self.args.device)
+                            us_input = torch.cat([
+                                (torch.ones(us_input.shape[0], 1) * self.uni_prompting.sptids_dict['<|mmu|>']).to(self.args.device),
+                                (torch.ones(us_input.shape[0], 1) * self.uni_prompting.sptids_dict['<|soi|>']).to(self.args.device),
+                                image_tokens,
+                                (torch.ones(us_input.shape[0], 1) * self.uni_prompting.sptids_dict['<|eoi|>']).to(self.args.device),
+                                (torch.ones(us_input.shape[0], 1) * self.uni_prompting.sptids_dict['<|sot|>']).to(self.args.device),
+                                us_input
+                            ], dim=1).long()
+                            us_mask = create_attention_mask_for_mmu(us_input.to(self.args.device),
+                                                        eoi_id=int(self.uni_prompting.sptids_dict['<|eoi|>'])).to(self.target_dtype)
+                            us_mask = us_mask.type(self.target_dtype)
+                            us_toks_list = self.model.mmu_generate(
+                                us_input, 
+                                attention_mask=us_mask,
+                                top_k=5,
+                                eot_token=self.uni_prompting.sptids_dict['<|eot|>'],
+                            )
+                            us_toks_list= torch.stack(us_toks_list).squeeze()[None]
+                            more_prompt = self.uni_prompting.text_tokenizer.batch_decode(us_toks_list, skip_special_tokens=True)[0].strip()
+                            
+                            logging.info(f"Question:{question}")
+                            logging.info(f"Answer:{more_prompt}")
+                            text_score=[]
+                            text_gt=[0 for _ in range(len(self.info['extra_info']))]
+                            text_gt[r-1]=1
+                            for r in range(len(self.info['extra_info'])):
+                                text_score.append(calculate_bleu(self.info['extra_info'][r],more_prompt))
+                            text_mean=sum(text_score)
+                            t_score=[0]*len(self.info['extra_info'])
+                            if text_mean>0:
+                                t_score=[t/text_mean for t in text_score]
+                            print('gtscore',text_gt,text_mean)
+                            print('bleuscore',t_score)
+                            final_score=(2.0-calculate_distance(text_gt,t_score))/2
+                            if final_score<=0.5:
+                                final_score=0
+                            else:
+                                final_score=(final_score-0.5)*2
+                            reward_text.append(final_score)
+                            logging.info(f"{self.local_rank}: Bleu score is {reward_text}")
+                            if self.args.llm=='gemini':
+                                more_prompt=extract(more_prompt,self.info["class"])
+                            elif self.args.llm=='glm':
+                                more_prompt=glm_extract(more_prompt,self.info["class"])
+                            cla=self.info['class']
+                            more_prompt=more_prompt.replace(f"{cla}",f"<{self.args.concept}>")
+                            if more_prompt:
+                                # 定义句尾标点，按优先级排序
+                                end_punctuations = ('.', '!', '?')
+                                # 遍历标点，找到第一个出现的句尾标点
+                                for punc in end_punctuations:
+                                    end_idx = more_prompt.find(punc)
+                                    if end_idx != -1:
+                                        # 截取到标点后一位（包含标点），作为第一句话
+                                        first_sentence = more_prompt[:end_idx + 1]
+                                        break
+                                else:
+                                    # 若没有找到句尾标点，则保留整个字符串
+                                    first_sentence = more_prompt
+                                # 更新more_prompt为第一句话
+                                more_prompt = first_sentence
+                            if '<|begin_of_box|>' in more_prompt:
+                                more_prompt=more_prompt.replace('<|begin_of_box|>','')
+                            if '<|end_of_box|>' in more_prompt:
+                                more_prompt=more_prompt.replace('<|end_of_box|>','')
+                            if 'empty' in more_prompt:
+                                more_prompt=''
+                            logging.info(f"After extraction:{more_prompt}")
+                            condition+=self.info['info']+more_prompt
+                            conditions = [condition] * batch_size_t2i
                         else:
-                            final_score=(final_score-0.5)*2
-                        reward_text.append(final_score)
-                        logging.info(f"{self.local_rank}: Bleu score is {reward_text}")
-                        if self.args.llm=='gemini':
-                            more_prompt=extract(more_prompt,self.info["class"])
-                        elif self.args.llm=='glm':
-                            more_prompt=glm_extract(more_prompt,self.info["class"])
-                        cla=self.info['class']
-                        more_prompt=more_prompt.replace(f"{cla}",f"<{self.args.concept}>")
-                        first_line = more_prompt.splitlines(True)[0] if more_prompt else ""
-                        more_prompt = first_line.rstrip('\n\r') if (more_prompt and '.' in first_line) else (more_prompt)
-                        if '<|begin_of_box|>' in more_prompt:
-                            more_prompt=more_prompt.replace('<|begin_of_box|>','')
-                        if '<|end_of_box|>' in more_prompt:
-                            more_prompt=more_prompt.replace('<|end_of_box|>','')
-                        if 'empty' in more_prompt:
-                            more_prompt=''
-                        logging.info(f"After extraction:{more_prompt}")
-                        condition+=self.info['info']+more_prompt
-                        conditions = [condition] * batch_size_t2i
-                    else:
-                        _,self.GT_IMAGE_PATH,SELECT_NUM=get_image_path(self.concept_train_path)
-                        key=''
-                        for tmp_keys in self.vqa.keys():
-                            if tmp_keys in self.GT_IMAGE_PATH:
-                                key=tmp_keys
-                                break
-                        
-                        select_vqa=random.choice(self.vqa[key])
-                        us_prompt=select_vqa['query']
-                        us_answer=select_vqa['answer']
-                        image_ori = Image.open(self.GT_IMAGE_PATH).convert("RGB")
-                        # tranforming the image to the required resolution
-                        image = image_transform(image_ori, resolution = self.config.dataset.params.resolution).to(self.args.device)
-                        image = image.unsqueeze(0)
+                            _,self.GT_IMAGE_PATH,SELECT_NUM=get_image_path(self.concept_train_path)
+                            key=''
+                            for tmp_keys in self.vqa.keys():
+                                if tmp_keys in self.GT_IMAGE_PATH:
+                                    key=tmp_keys
+                                    break
+                            
+                            select_vqa=random.choice(self.vqa[key])
+                            us_prompt=select_vqa['query']
+                            us_answer=select_vqa['answer']
+                            image_ori = Image.open(self.GT_IMAGE_PATH).convert("RGB")
+                            # tranforming the image to the required resolution
+                            image = image_transform(image_ori, resolution = self.config.dataset.params.resolution).to(self.args.device)
+                            image = image.unsqueeze(0)
 
-                        image_tokens_mmu = self.vq_model.get_code(image)
-                        image_tokens = (image_tokens_mmu + len(self.uni_prompting.text_tokenizer)).long()
-                        us_input = self.uni_prompting.text_tokenizer(['USER: ' + us_prompt + ' ASSISTANT:'])['input_ids']
-                        us_input = torch.tensor(us_input).to(self.args.device)
-                        us_input = torch.cat([
-                            (torch.ones(us_input.shape[0], 1) * self.uni_prompting.sptids_dict['<|mmu|>']).to(self.args.device),
-                            (torch.ones(us_input.shape[0], 1) * self.uni_prompting.sptids_dict['<|soi|>']).to(self.args.device),
-                            image_tokens,
-                            (torch.ones(us_input.shape[0], 1) * self.uni_prompting.sptids_dict['<|eoi|>']).to(self.args.device),
-                            (torch.ones(us_input.shape[0], 1) * self.uni_prompting.sptids_dict['<|sot|>']).to(self.args.device),
-                            us_input
-                        ], dim=1).long()
-                        us_mask = create_attention_mask_for_mmu(us_input.to(self.args.device),
-                                                    eoi_id=int(self.uni_prompting.sptids_dict['<|eoi|>'])).to(self.target_dtype)
-                        us_mask = us_mask.type(self.target_dtype)
-                        us_toks_list = self.model.mmu_generate(
-                            us_input, 
-                            attention_mask=us_mask,
-                            top_k=5,
-                            eot_token=self.uni_prompting.sptids_dict['<|eot|>'],
-                        )
-                        us_toks_list= torch.stack(us_toks_list).squeeze()[None]
-                        more_prompt = self.uni_prompting.text_tokenizer.batch_decode(us_toks_list, skip_special_tokens=True)[0].strip()
-                        
-                        logging.info(f"Question:{us_prompt}")
-                        logging.info(f"GT:{us_answer}")
-                        logging.info(f"Answer:{more_prompt}")
-                        reward_text.append(calculate_bleu(us_answer,more_prompt))
-                        logging.info(f"{self.local_rank}: Bleu score is {reward_text}")
-                        if self.args.llm=='gemini':
-                            more_prompt=extract(more_prompt,self.info["class"])
-                        elif self.args.llm=='glm':
-                            more_prompt=glm_extract(more_prompt,self.info["class"])
-                        cla=self.info['class']
-                        more_prompt=more_prompt.replace(f"{cla}",f"<{self.args.concept}>")
-                        
-                        first_line = more_prompt.splitlines(True)[0] if more_prompt else ""
-                        more_prompt = first_line.rstrip('\n\r') if (more_prompt and '.' in first_line) else (more_prompt)
-                        if '<|begin_of_box|>' in more_prompt:
-                            more_prompt=more_prompt.replace('<|begin_of_box|>','')
-                        if '<|end_of_box|>' in more_prompt:
-                            more_prompt=more_prompt.replace('<|end_of_box|>','')
-                        if 'empty' in more_prompt:
-                            more_prompt=''
-                        logging.info(f"After extraction:{more_prompt}")
-                        condition+=self.info['info']+more_prompt
-                        conditions = [condition] * batch_size_t2i
+                            image_tokens_mmu = self.vq_model.get_code(image)
+                            image_tokens = (image_tokens_mmu + len(self.uni_prompting.text_tokenizer)).long()
+                            us_input = self.uni_prompting.text_tokenizer(['USER: ' + us_prompt + ' ASSISTANT:'])['input_ids']
+                            us_input = torch.tensor(us_input).to(self.args.device)
+                            us_input = torch.cat([
+                                (torch.ones(us_input.shape[0], 1) * self.uni_prompting.sptids_dict['<|mmu|>']).to(self.args.device),
+                                (torch.ones(us_input.shape[0], 1) * self.uni_prompting.sptids_dict['<|soi|>']).to(self.args.device),
+                                image_tokens,
+                                (torch.ones(us_input.shape[0], 1) * self.uni_prompting.sptids_dict['<|eoi|>']).to(self.args.device),
+                                (torch.ones(us_input.shape[0], 1) * self.uni_prompting.sptids_dict['<|sot|>']).to(self.args.device),
+                                us_input
+                            ], dim=1).long()
+                            us_mask = create_attention_mask_for_mmu(us_input.to(self.args.device),
+                                                        eoi_id=int(self.uni_prompting.sptids_dict['<|eoi|>'])).to(self.target_dtype)
+                            us_mask = us_mask.type(self.target_dtype)
+                            us_toks_list = self.model.mmu_generate(
+                                us_input, 
+                                attention_mask=us_mask,
+                                top_k=5,
+                                eot_token=self.uni_prompting.sptids_dict['<|eot|>'],
+                            )
+                            us_toks_list= torch.stack(us_toks_list).squeeze()[None]
+                            more_prompt = self.uni_prompting.text_tokenizer.batch_decode(us_toks_list, skip_special_tokens=True)[0].strip()
+                            
+                            logging.info(f"Question:{us_prompt}")
+                            logging.info(f"GT:{us_answer}")
+                            logging.info(f"Answer:{more_prompt}")
+                            reward_text.append(calculate_bleu(us_answer,more_prompt))
+                            logging.info(f"{self.local_rank}: Bleu score is {reward_text}")
+                            if self.args.llm=='gemini':
+                                more_prompt=extract(more_prompt,self.info["class"])
+                            elif self.args.llm=='glm':
+                                more_prompt=glm_extract(more_prompt,self.info["class"])
+                            cla=self.info['class']
+                            more_prompt=more_prompt.replace(f"{cla}",f"<{self.args.concept}>")
+                            if more_prompt:
+                                # 定义句尾标点，按优先级排序
+                                end_punctuations = ('.', '!', '?')
+                                # 遍历标点，找到第一个出现的句尾标点
+                                for punc in end_punctuations:
+                                    end_idx = more_prompt.find(punc)
+                                    if end_idx != -1:
+                                        # 截取到标点后一位（包含标点），作为第一句话
+                                        first_sentence = more_prompt[:end_idx + 1]
+                                        break
+                                else:
+                                    # 若没有找到句尾标点，则保留整个字符串
+                                    first_sentence = more_prompt
+                                # 更新more_prompt为第一句话
+                                more_prompt = first_sentence
+                            if '<|begin_of_box|>' in more_prompt:
+                                more_prompt=more_prompt.replace('<|begin_of_box|>','')
+                            if '<|end_of_box|>' in more_prompt:
+                                more_prompt=more_prompt.replace('<|end_of_box|>','')
+                            if 'empty' in more_prompt:
+                                more_prompt=''
+                            logging.info(f"After extraction:{more_prompt}")
+                            condition+=self.info['info']+more_prompt
+                            conditions = [condition] * batch_size_t2i
 
                     ref_logits=self.ref_model.reference(condition,epoch,batch_idx,self.local_rank,group_id).to(self.args.device, dtype=self.target_dtype)
                     ref_logits = torch.clamp(ref_logits, min=1e-10, max=1e10)
@@ -430,20 +494,102 @@ class unic_grpo(Trainer):
 
                     
                     # with torch.no_grad():
-                    gen_token_ids,logits = self.model.t2i_generate(
-                        input_ids=input_ids_infer,
-                        uncond_input_ids=uncond_input_ids,
-                        attention_mask=attention_mask1,
-                        guidance_scale=self.config.guidance_scale,
-                        temperature=self.config.training.get("generation_temperature",1.0),
-                        timesteps=self.config.generation_timesteps,
-                        noise_schedule=mask_schedule,
-                        noise_type=self.config.training.get("noise_type", "mask"),
-                        seq_len=self.config.model.showo.num_vq_tokens,
-                        uni_prompting=self.uni_prompting,
-                        config=self.config,
-                        return_logits=True,
-                    )
+                    if self.args.accelerate:
+                        save_checkpoint=True
+                        while True:
+                            accounter+=1
+                            gen_token_ids_ac,checkpoint = self.model.t2i_generate(
+                                input_ids=input_ids_infer,
+                                uncond_input_ids=uncond_input_ids,
+                                attention_mask=attention_mask1,
+                                guidance_scale=self.config.guidance_scale,
+                                temperature=self.config.training.get("generation_temperature",1.0),
+                                timesteps=self.config.generation_timesteps,
+                                noise_schedule=mask_schedule,
+                                noise_type=self.config.training.get("noise_type", "mask"),
+                                seq_len=self.config.model.showo.num_vq_tokens,
+                                uni_prompting=self.uni_prompting,
+                                config=self.config,
+                                return_logits=True,
+                                save_checkpoint=save_checkpoint,
+                                checkpoint_step=10
+                            )
+                            gen_token_ids_clamped_ac = torch.clamp(
+                                gen_token_ids_ac, 
+                                min=0, 
+                                max=self.config.model.showo.codebook_size - 1
+                            )
+                            images_tensor_ac = self.vq_model.decode_code(gen_token_ids_clamped_ac)
+                            images_tensor_ac = torch.clamp((images_tensor_ac + 1.0) / 2.0, min=0.0, max=1.0)
+                            images_tensor_ac = images_tensor_ac * 255.0
+                            images_tensor_ac = images_tensor_ac.permute(0, 2, 3, 1)
+                            images_np_ac = images_tensor_ac.detach().cpu().numpy().astype(np.uint8)
+                            gen_image_ac = Image.fromarray(images_np_ac[0])
+                            # 创建保存目录（防止路径不存在）
+                            save_path_ac=os.path.join(self.args.save_dir,'accelerate/',self.args.concept,f"gpu{self.local_rank}_num{accelerate_counter}.png")
+                            mkdir(os.path.join(self.args.save_dir,'accelerate/',self.args.concept))
+                            accelerate_counter += 1 
+                            # 保存图像
+                            gen_image_ac.save(save_path_ac)
+                            logging.info(f"临时图像已经保存至{save_path_ac}")
+                            clip_model.save_dir=save_path_ac
+                            try:
+                                simg,stext=clip_model.evaluate_concept(self.args.concept,'',0,prompt=remove_token(condition))
+                                s=simg*0.65+stext*0.35
+                            except:
+                                simg,_=clip_model.evaluate_concept(self.args.concept,'',0)
+                                s=simg
+                            logging.info(f"临时图片评分{s}")
+                            if s > self.threshold:
+                                gen_token_ids,logits = self.model.t2i_generate(
+                                    checkpoint=checkpoint,
+                                    attention_mask=attention_mask1,
+                                    config=self.config,
+                                    timesteps=self.config.generation_timesteps, 
+                                    guidance_scale=self.config.guidance_scale,
+                                    noise_schedule=mask_schedule,
+                                    return_logits=True,
+                                )
+                                # os.remove(temp_save_path)  # 删除临时图像
+                                del gen_token_ids_ac, gen_image_ac, images_tensor_ac, images_np_ac  # 释放CPU/GPU变量
+                                del checkpoint  # 断点已使用，释放内存
+                                torch.cuda.empty_cache()  # 清理GPU缓存
+                                break
+
+                            else:
+                                if os.path.exists(save_path_ac):
+                                    os.remove(save_path_ac)
+                                    logging.info(f"已删除临时图像: {save_path_ac}")
+                                
+                                # 2. 清理显存/内存（关键：避免累积占用）
+                                # 释放第9步相关张量
+                                del gen_token_ids_ac, gen_image_ac, images_tensor_ac, images_np_ac
+                                # 释放断点（未使用，直接删除）
+                                del checkpoint
+                                torch.cuda.empty_cache()
+                                # 强制Python垃圾回收（清理未引用的内存对象）
+                                import gc
+                                gc.collect()
+                                
+                                logging.info(f"重新生成")
+                                # 重新调用生成逻辑（复用当前循环的参数，无需额外传参）
+                                continue  # 回到循环开头，重新执行9步生成
+
+                    else:
+                        gen_token_ids,logits = self.model.t2i_generate(
+                            input_ids=input_ids_infer,
+                            uncond_input_ids=uncond_input_ids,
+                            attention_mask=attention_mask1,
+                            guidance_scale=self.config.guidance_scale,
+                            temperature=self.config.training.get("generation_temperature",1.0),
+                            timesteps=self.config.generation_timesteps,
+                            noise_schedule=mask_schedule,
+                            noise_type=self.config.training.get("noise_type", "mask"),
+                            seq_len=self.config.model.showo.num_vq_tokens,
+                            uni_prompting=self.uni_prompting,
+                            config=self.config,
+                            return_logits=True
+                        )
                     logits = torch.clamp(logits, min=1e-10, max=1e10)
                     local_gen_token_ids = gen_token_ids#[self.local_rank::self.world_size]
                     local_logits = logits#[self.local_rank::self.world_size]
@@ -520,24 +666,16 @@ class unic_grpo(Trainer):
                 path_list=[os.path.join(image_path,f"batch_{batch_idx}_{self.world_size*j+self.local_rank}.png") for j in range(self.group)]
                 all_path_list=[os.path.join(image_path,f"batch_{batch_idx}_{j}.png") for j in range(self.group*self.num_generations)]
 
-                fm=''
-                for f in ['0.png','0.jpg','0.jepg']:
-                    ref_path = os.path.join(self.args.data_root,'concept/train',self.args.concept,f)
-                    if Path(ref_path).exists():
-                        fm=f
-                        break
+
 
                 #clip reward
                 reward2_list=[]
-                    
-                clip_model=SHOWO_P_CLIPEvaluator(
-                    "cuda:3",
-                    clip_model=os.path.join(self.args.work_dir,'ViT-B-32.pt'),
-                    data_root=self.args.data_root,
-                    work_dir=self.args.work_dir,
-                    save_dir=fm,
-                    dtype=self.target_dtype
-                )
+                fr_list=[]
+                fn_list=[]
+                mix_list=[]
+                clip_list=[]
+                name_list=[]
+
                 for path in path_list:
                     if 'man' in self.info['class'].lower():
                         sig1=0
@@ -545,21 +683,27 @@ class unic_grpo(Trainer):
                         try:
                             fr_score=face_recognition_score(path,self.args.data_root,self.args.concept)
                             sig1=1
-                        except:
-                            print('---------------Face recognition False!')
+                        except Exception as e:
+                            print(f'---------------Face recognition False! 错误信息: {str(e)}')
                             pass
                         try:
                             fn_score=facenet_score(path,self.args.data_root,self.args.concept)
                             sig2=1
-                        except:
-                            print('---------------FaceNet False!')
+                        except Exception as e:
+                            print(f'---------------FaceNet False! 错误信息: {str(e)}')
                             pass
                         if sig1==1 and sig2==1:
                             sim=0.7*fn_score+0.3*fr_score
+                            mix_list.append(sim)
+                            name_list.append('mix')
                         elif sig1==1:
                             sim=fr_score
+                            fr_list.append(sim)
+                            name_list.append('fr')
                         elif sig2==1:
                             sim=fn_score
+                            fn_list.append(sim)
+                            name_list.append('fn')
                         else:
                             clip_model.save_dir=path
                             sim=clip_model.evaluate_concept(self.args.concept,'',0)
@@ -567,6 +711,8 @@ class unic_grpo(Trainer):
                                 sim=0
                             else:
                                 sim=2*(sim-0.5)
+                            clip_list.append(sim)
+                            name_list.append('clip')
                         reward2_list.append(sim)
                     else:
                         clip_model.save_dir=path
@@ -576,6 +722,23 @@ class unic_grpo(Trainer):
                         else:
                             sim=2*(sim-0.5)
                         reward2_list.append(sim)
+                        name_list.append('clip')
+                        clip_list.append(sim)
+                mix_mean = sum(mix_list)/len(mix_list) if len(mix_list) > 0 else 0.8
+                fr_mean = sum(fr_list)/len(fr_list) if len(fr_list) > 0 else 0.8
+                fn_mean = sum(fn_list)/len(fn_list) if len(fn_list) > 0 else 0.8
+                clip_mean = sum(clip_list)/len(clip_list) if len(clip_list) > 0 else 0.8
+
+                # 遍历奖励列表，根据类型进行调整
+                for idx in range(len(reward2_list)):
+                    if name_list[idx] == 'mix':
+                        reward2_list[idx] -= (mix_mean - 0.8)
+                    elif name_list[idx] == 'fr':
+                        reward2_list[idx] -= (fr_mean - 0.8)
+                    elif name_list[idx] == 'fn':
+                        reward2_list[idx] -= (fn_mean - 0.8)
+                    elif name_list[idx] == 'clip':
+                        reward2_list[idx] -= (clip_mean - 0.8)
                 # print('score',sum(reward2_list)/len(reward2_list))
                 print('similarity',path,sim)
                 rewards2=torch.tensor(reward2_list).float().reshape(self.group).to(self.args.device,self.target_dtype)
@@ -667,8 +830,9 @@ class unic_grpo(Trainer):
                     rewards = rewards2 * 0.4 + my_rewards3 * 0.6
                 else:
                     rewards=rewards2
-                reward_text=torch.tensor(reward_text).float().reshape(self.group).to(self.args.device,self.target_dtype)
-                rewards=rewards*0.65+reward_text*0.35
+                if self.args.semantic:
+                    reward_text=torch.tensor(reward_text).float().reshape(self.group).to(self.args.device,self.target_dtype)
+                    rewards=rewards*0.65+reward_text*0.35
                 counter+=1
                 # update_best_results(path_list,rewards.cpu().detach().numpy().tolist(),counter)
 
@@ -718,17 +882,17 @@ class unic_grpo(Trainer):
                 log_ratio =per_token_logps - ref_per_token_logps
                 log_ratio = torch.clamp(log_ratio, -10, 10)
                 ratio = torch.exp(log_ratio)
+                unclipped_loss = ratio * advantages.unsqueeze(1).unsqueeze(2)
+                clipped_ratio = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon)  # 典型ε=0.2
+                clipped_loss = clipped_ratio * advantages.unsqueeze(1).unsqueeze(2)
+                surrogate_loss = -torch.min(unclipped_loss, clipped_loss)  # 负号表示最小化损失
 
-                
-                per_token_loss= ratio* advantages.unsqueeze(1).unsqueeze(2)
-                if self.local_rank==0:
-                    print('bf mean of per_token_loss',per_token_loss.mean())
-                    print('ratio',ratio)
-                per_token_kl = ratio - log_ratio - 1
+                # 5. 计算KL散度正则项（加到损失中）
+                per_token_kl = (ref_per_token_logps - per_token_logps) * ratio  # 正确的KL计算方式
+                kl_regularization = self.beta * per_token_kl  # self.beta是KL权重（如0.1）
 
-                
-
-                per_token_loss = -(per_token_loss - self.beta * per_token_kl)
+                # 6. 结合掩码计算最终损失（过滤无效token）
+                per_token_loss = surrogate_loss + kl_regularization
 
                 if self.local_rank==0:
                     logging.info(f"mean of kl: {per_token_kl.mean()}")
@@ -808,7 +972,6 @@ class unic_grpo(Trainer):
                 self.scheduler.step()
                 # if self.args.t2i_data and (epoch+1) % 10 == 0:
                 #     print('epoch',epoch+1,'loss',loss.item())
-
                 loss_tensor = torch.tensor([loss.item()], device=loss.device)
                 dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
                 world_size = dist.get_world_size()
@@ -816,7 +979,17 @@ class unic_grpo(Trainer):
                 if dist.get_rank() == 0:
                     loss_list.append(avg_loss)
                     logging.info(f"{batch_idx} loss: {avg_loss:.4f}")
-
+                accounter_tensor = torch.tensor([accounter], dtype=torch.int64, device=self.args.device)
+                dist.all_reduce(accounter_tensor, op=dist.ReduceOp.SUM)
+                rr=(self.num_generations*self.group)/(accounter_tensor.item())
+                rrr=self.accelerate_rate-rr
+                delta=0.12*rrr
+                tmp_threshold=self.threshold**(1+delta)
+                if tmp_threshold-self.threshold>0.01:
+                    self.threshold+=1
+                if tmp_threshold-self.threshold<-0.01:
+                    self.threshold-=1
+                logging.info(f"threshold turns into {self.threshold}")
                 # for (n1, p1), (n2, p2) in zip(self.model.named_parameters(), self.ref_model.named_parameters()):
                 #     if torch.allclose(p1, p2)!=True:
                 #         print(f"parameter {n1} is not equal")
@@ -824,5 +997,7 @@ class unic_grpo(Trainer):
                 del rewards, per_token_logps, ref_per_token_logps
                 gc.collect()
                 torch.cuda.empty_cache()
+            loss_final.append(loss_list)
+            logging.info(f"loss: {loss_final}")
             if epoch%self.args.interval_epochs==0 and epoch>0:
-                save_distributed_model(self.model,self.optimizer,os.path.join(self.args.save_dir,'model_weights',self.args.concept,'model_weights'),epoch=epoch)
+                save_distributed_model(self.model,self.optimizer,os.path.join(self.args.save_dir,'model_weights',self.args.concept),epoch=epoch)
