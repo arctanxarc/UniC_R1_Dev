@@ -115,53 +115,59 @@ class Showo(ModelMixin, ConfigMixin):
             generator: torch.Generator = None,
             config=None,
             return_logits=False,
+            checkpoint=None,
+            save_checkpoint=False,
+            checkpoint_step=0,
             **kwargs,
     ):
         """
         Generate 1:1 similar to the original MaskGit repo
         https://github.com/google-research/maskgit/blob/main/maskgit/libml/parallel_decode.py#L79
         """
-        # begin with all image token ids masked
-        mask_token_id = self.config.mask_token_id   # 58497
-        num_vq_tokens = config.model.showo.num_vq_tokens    # 256
-        num_new_special_tokens = config.model.showo.num_new_special_tokens  # 10
+        if checkpoint is not None:
+            step_start = checkpoint["step"]
+            mask_token_id = checkpoint["mask_token_id"]
+            num_vq_tokens = checkpoint["num_vq_tokens"]
+            num_new_special_tokens = checkpoint["num_new_special_tokens"]
+            input_ids = checkpoint["input_ids"]
+            input_ids_minus_lm_vocab_size = checkpoint["input_ids_minus_lm_vocab_size"]
+            uncond_prefix = checkpoint["uncond_prefix"]
+            # 恢复温度参数状态（保证与第9步时一致）
+            temperature = checkpoint["temperature"]
+        else:
+            step_start=0
+            # begin with all image token ids masked
+            mask_token_id = self.config.mask_token_id   # 58497
+            num_vq_tokens = config.model.showo.num_vq_tokens    # 256
+            num_new_special_tokens = config.model.showo.num_new_special_tokens  # 10
 
-        input_ids_minus_lm_vocab_size = input_ids[:, -(num_vq_tokens + 1):-1].clone()
-        input_ids_minus_lm_vocab_size = torch.where(input_ids_minus_lm_vocab_size == mask_token_id,
-                                                    mask_token_id,
-                                                    input_ids_minus_lm_vocab_size - config.model.showo.llm_vocab_size - num_new_special_tokens)
+            input_ids_minus_lm_vocab_size = input_ids[:, -(num_vq_tokens + 1):-1].clone()
+            input_ids_minus_lm_vocab_size = torch.where(input_ids_minus_lm_vocab_size == mask_token_id,
+                                                        mask_token_id,
+                                                        input_ids_minus_lm_vocab_size - config.model.showo.llm_vocab_size - num_new_special_tokens)
 
-        # for classifier-free guidance
-        if uncond_input_ids is not None:
-            uncond_prefix = uncond_input_ids[:, :config.dataset.preprocessing.max_seq_length + 1]
+            # for classifier-free guidance
+            if uncond_input_ids is not None:
+                uncond_prefix = uncond_input_ids[:, :config.dataset.preprocessing.max_seq_length + 1]
 
-        for step in range(timesteps):
-            if uncond_input_ids is not None and guidance_scale > 0:
+        for step in range(step_start,timesteps):
+            if uncond_prefix is not None and guidance_scale > 0:
                 uncond_input_ids = torch.cat(
                     [uncond_prefix, input_ids[:, config.dataset.preprocessing.max_seq_length + 1:]], dim=1)
                 model_input = torch.cat([input_ids, uncond_input_ids])
-                # print(model_input,attention_mask)
-                cond_logits, uncond_logits = self(model_input, attention_mask=attention_mask).chunk(2)
+                with torch.enable_grad():
+                    cond_logits, uncond_logits = self(model_input, attention_mask=attention_mask).chunk(2)
                 # logits = uncond_logits + guidance_scale * (cond_logits - uncond_logits)
                 # it seems that muse has a different cfg setting
                 logits = (1 + guidance_scale) * cond_logits - guidance_scale * uncond_logits
                 logits = logits[:, -(num_vq_tokens + 1):-1, config.model.showo.llm_vocab_size + num_new_special_tokens:-1]
             else:
-                logits = self(input_ids, attention_mask=attention_mask)
+                with torch.enable_grad():
+                    logits = self(input_ids, attention_mask=attention_mask)
                 logits = logits[:, -(num_vq_tokens + 1):-1, config.model.showo.llm_vocab_size + num_new_special_tokens:-1]
             # print(cond_logits,uncond_logits,logits)
-            logits = torch.nan_to_num(logits, nan=-1e9, posinf=-1e9, neginf=-1e9)
+            # logits = torch.nan_to_num(logits, nan=-1e9, posinf=-1e9, neginf=-1e9)
             probs = logits.softmax(dim=-1)
-            probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-            probs = torch.clamp(probs, min=0.0)
-            # 修复2：重新归一化概率（确保每行和为1，满足multinomial要求）
-            probs_sum = probs.sum(dim=-1, keepdim=True)
-            zero_sum_mask = probs_sum < 1e-9
-            # 处理概率和为0的极端情况（用均匀分布兜底）
-            if torch.any(zero_sum_mask).item():
-                probs[zero_sum_mask] = 1.0 / probs.size(-1)
-            else:
-                probs = probs / probs_sum
             sampled = probs.reshape(-1, logits.size(-1))
             sampled_ids = torch.multinomial(sampled, 1, generator=generator)[:, 0].view(*logits.shape[:-1])
             # sampled_ids = torch.argmax(sampled, dim=-1).view(*logits.shape[:-1])
@@ -185,6 +191,24 @@ class Showo(ModelMixin, ConfigMixin):
             mask_len = torch.max(
                 torch.tensor([1], device=logits.device), torch.min(unknown_map.sum(dim=-1, keepdim=True) - 1, mask_len)
             )
+
+            if save_checkpoint and step == checkpoint_step:  # 关键：第9步触发，一次性填充所有掩码
+                mask_len = torch.tensor([0], device=logits.device).unsqueeze(0)  # 掩码长度设为0，所有token均保留
+                # 用当前step的预测结果覆盖所有剩余掩码（确保无遗漏）
+                sampled_ids = torch.where(unknown_map, sampled_ids, input_ids_minus_lm_vocab_size)
+                checkpoint = {
+                        "step": step + 1, 
+                        "mask_token_id": mask_token_id,
+                        "num_vq_tokens": num_vq_tokens,
+                        "num_new_special_tokens": num_new_special_tokens,
+                        "input_ids": input_ids, 
+                        "input_ids_minus_lm_vocab_size": input_ids_minus_lm_vocab_size,
+                        "uncond_prefix": uncond_prefix,
+                        "temperature": temperature * (1.0 - ratio), 
+                        "model_parameters": list(self.parameters()),
+                    }
+                return sampled_ids,checkpoint
+            
             # Adds noise for randomness
             temperature = temperature * (1.0 - ratio)
             masking = mask_by_random_topk(mask_len, selected_probs, temperature, generator=generator)
@@ -294,7 +318,18 @@ class Showo(ModelMixin, ConfigMixin):
             device = idx.device
         except:
             device = input_embeddings.device
+        # 在获取logits前添加（函数开头附近）
+        if input_embeddings is not None:
+            if torch.isnan(input_embeddings).any():
+                print("❌ 输入embedding含nan")
+            if torch.isinf(input_embeddings).any():
+                print("❌ 输入embedding含inf")
 
+        if attention_mask is not None:
+            if torch.isnan(attention_mask).any():
+                print("❌ 注意力掩码含nan")
+            if torch.isinf(attention_mask).any():
+                print("❌ 注意力掩码含inf")
         result = []
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
@@ -321,23 +356,48 @@ class Showo(ModelMixin, ConfigMixin):
 
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
-            logits = torch.nan_to_num(logits, nan=-1e9, posinf=-1e9, neginf=-1e9)
+            # 新增logits检测
+            if torch.isnan(logits).any():
+                print(f"❌ logits（温度缩放后）含nan，数量：{torch.isnan(logits).sum().item()}")
+                print(f"logits范围：{logits.min().item()} ~ {logits.max().item()}")
+                print(input_embeddings)
+            if torch.isinf(logits).any():
+                print(f"❌ logits（温度缩放后）含inf，数量：{torch.isinf(logits).sum().item()}")
+                print(f"logits范围：{logits.min().item()} ~ {logits.max().item()}")
+            if (logits < -1e18).any():  # 极端负值可能导致softmax后为0，但需警惕
+                print(f"❌ logits（温度缩放后）含极端负值，数量：{(logits < -1e18).sum().item()}")
+            # logits = torch.nan_to_num(logits, nan=-1e9, posinf=-1e9, neginf=-1e9)
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
+                # if torch.isinf(logits).any():
+                #     print(f"❌ logits（top_k裁剪后）含inf，数量：{torch.isinf(logits).sum().item()}")
+                #     print(f"top_k后logits范围：{logits.min().item()} ~ {logits.max().item()}")
+
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
-            probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-            probs = torch.clamp(probs, min=0.0)
+            # 新增probs全维度检测
+            if torch.isnan(probs).any():
+                print(f"❌ probs（softmax后）含nan，数量：{torch.isnan(probs).sum().item()}")
+            if torch.isinf(probs).any():
+                print(f"❌ probs（softmax后）含inf，数量：{torch.isinf(probs).sum().item()}")
+            if (probs < 0).any():
+                print(f"❌ probs（softmax后）含负值，数量：{(probs < 0).sum().item()}")
+                print(f"probs负值范围：{probs[probs < 0].min().item()} ~ {probs[probs < 0].max().item()}")
+            if (probs.sum(dim=-1) < 0.9).any():  # softmax后每行和应≈1，若远小于1可能有异常
+                print(f"❌ probs行和异常（<0.9），数量：{(probs.sum(dim=-1) < 0.9).sum().item()}")
+                print(f"probs行和范围：{probs.sum(dim=-1).min().item()} ~ {probs.sum(dim=-1).max().item()}")
+            # probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+            # probs = torch.clamp(probs, min=0.0)
             # 修复2：重新归一化概率（确保每行和为1，满足multinomial要求）
-            probs_sum = probs.sum(dim=-1, keepdim=True)
-            zero_sum_mask = probs_sum < 1e-9
+            # probs_sum = probs.sum(dim=-1, keepdim=True)
+            # zero_sum_mask = probs_sum < 1e-9
             # 处理概率和为0的极端情况（用均匀分布兜底）
-            if torch.any(zero_sum_mask).item():
-                probs[zero_sum_mask] = 1.0 / probs.size(-1)
-            else:
-                probs = probs / probs_sum
+            # if torch.any(zero_sum_mask).item():
+                # probs[zero_sum_mask] = 1.0 / probs.size(-1)
+            # else:
+                # probs = probs / probs_sum
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
             result.append(idx_next[0][0])
