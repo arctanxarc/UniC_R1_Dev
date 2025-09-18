@@ -129,7 +129,7 @@ class SHOWO_P_CLIPEvaluator(CLIPEvaluator):
         avg_similarity = sum(sims) / len(sims)
         return avg_similarity
     
-    def evaluate_concept(self, concept, ckpt_name, epoch2load):
+    def evaluate_concept(self, concept, ckpt_name, epoch2load,prompt=''):
         
         self.results[concept] = {}
         
@@ -171,8 +171,11 @@ class SHOWO_P_CLIPEvaluator(CLIPEvaluator):
         img_path=self.save_dir
         generated_image = Image.open(img_path).convert("RGB")
         generated_image_tensor = self.image_transform(generated_image).unsqueeze(0).to(self.device)
-        sim_samples_to_img, _ = self.evaluate(src_images_tensor, generated_image_tensor, '')
-        return sim_samples_to_img
+        sim_samples_to_img, sim_samples_to_text = self.evaluate(src_images_tensor, generated_image_tensor, prompt)
+        if len(prompt)>0:
+            return sim_samples_to_img,sim_samples_to_text
+        else:
+            return sim_samples_to_img
 
     def save_results(self, save_path):
         with open(save_path, 'w') as f:
