@@ -54,6 +54,7 @@ class ref_model:
         self.args.num_gen_images=num_gen
         self.args.t2i_batch_size=num_batch
         self.args.device=device
+       
         path=os.path.join('./','ref_image',self.args.concept)
         mkdir(path)
         self.save_dir=path
@@ -195,27 +196,23 @@ class ref_model:
                 raise ValueError("lm_head weights do not match the input embeddings!")
 
         self.config.model.showo.llm_vocab_size = len(self.tokenizer) - 10
-        self.init_param_snapshot = self._save_param_snapshot()  # 存储初始化时的参数状态
-        print("✅ ref_model 初始化完成，已保存参数快照")
+        self.init_param_snapshot = self._save_param_snapshot()  # 存储初始化时的参数状怄1�7
+        print("ref_model 初始化完成，已保存参数")
     def _save_param_snapshot(self):
-        """
-        生成模型关键参数的快照（哈希值+部分权重统计），用于后续对比
-        聚焦易变化的层：输入嵌入层、lm_head层（避免全量参数存储）
-        """
         snapshot = {}
         device = self.device
 
-        # 1. 输入嵌入层参数（最易变化的新token权重）
+        # 1. 输入嵌入层参数（朢�易变化的新token权重＄1�7
         embed_layer = self.model.showo.get_input_embeddings()
-        # 计算嵌入层权重的哈希值（避免存储全量权重，用哈希快速对比）
-        embed_weight_hash = torch.sum(embed_layer.weight.data).item()  # 用求和哈希快速校验（也可用md5，求和更轻量）
+        # 计算嵌入层权重的哈希值（避免存储全量权重，用哈希快��对比）
+        embed_weight_hash = torch.sum(embed_layer.weight.data).item()  # 用求和哈希快速校验（也可用md5，求和更轻量＄1�7
         embed_weight_shape = embed_layer.weight.data.shape  # 记录形状（防止维度变化）
         snapshot["input_embedding"] = {
             "hash": round(embed_weight_hash, 6),  # 保留6位小数，避免浮点精度问题
             "shape": embed_weight_shape
         }
 
-        # 2. lm_head层参数（输出层，与嵌入层权重关联）
+        # 2. lm_head层参数（输出层，与嵌入层权重关联＄1�7
         lm_head = self.model.showo.lm_head
         lm_weight_hash = torch.sum(lm_head.weight.data).item()
         lm_weight_shape = lm_head.weight.data.shape
@@ -223,7 +220,7 @@ class ref_model:
             "hash": round(lm_weight_hash, 6),
             "shape": lm_weight_shape
         }
-        # 若lm_head有bias，也记录bias状态
+        # 若lm_head有bias，也记录bias状��1�7
         if hasattr(lm_head, "bias") and lm_head.bias is not None:
             lm_bias_hash = torch.sum(lm_head.bias.data).item()
             snapshot["lm_head_bias"] = {
@@ -231,9 +228,9 @@ class ref_model:
                 "shape": lm_head.bias.data.shape
             }
 
-        # 3. 新增token的权重（重点关注用户添加的<concept>和<token_x>）
-        # 获取新增token的ID范围（original_text_vocab_size 到 new_text_vocab_size）
-        original_text_vocab_size = len(self.tokenizer) - len(self.tokenizer.added_tokens_encoder)  # 原始词表大小（减去新增token）
+        # 3. 新增token的权重（重点关注用户添加的1�7<concept>咄1�7<token_x>＄1�7
+        # 获取新增token的ID范围（original_text_vocab_size 刄1�7 new_text_vocab_size＄1�7
+        original_text_vocab_size = len(self.tokenizer) - len(self.tokenizer.added_tokens_encoder)  # 原始词表大小（减去新增token＄1�7
         new_text_vocab_size = len(self.tokenizer)  # 新增后的词表大小
         new_token_embed = embed_layer.weight.data[original_text_vocab_size:new_text_vocab_size]
         snapshot["new_token_embedding"] = {
@@ -281,7 +278,7 @@ class ref_model:
             else:
                 mask_schedule = get_mask_chedule(self.config.training.get("mask_schedule", "cosine"))
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 gen_token_ids,logits = self.model.t2i_generate(
                     input_ids=input_ids,
                     uncond_input_ids=uncond_input_ids,
@@ -308,45 +305,33 @@ class ref_model:
                     gen_image.save(os.path.join(self.save_dir, f"E{epoch}B{batch_idx}R{rank}G{group_id}N{self.args.t2i_batch_size * i + j}.png"))
             return logits
     def check_param_change(self, verbose=True) -> bool:
-        """
-        对比当前模型参数与初始化快照是否一致
-        返回值：True=参数有变化，False=参数无变化
-        verbose：是否打印详细对比日志
-        """
         current_snapshot = self._save_param_snapshot()
         has_change = False
         change_log = []
 
-        # 对比每个关键参数项
         for param_key in self.init_param_snapshot.keys():
             init_data = self.init_param_snapshot[param_key]
             current_data = current_snapshot.get(param_key, None)
 
-            # 1. 先检查参数是否存在
             if current_data is None:
                 has_change = True
-                change_log.append(f"❌ 参数项 {param_key} 丢失（初始化时存在，当前不存在）")
                 continue
 
-            # 2. 检查参数形状是否一致（防止维度被修改）
             if init_data["shape"] != current_data["shape"]:
                 has_change = True
                 change_log.append(
-                    f"❌ 参数 {param_key} 形状变化："
-                    f"初始化时 {init_data['shape']} → 当前 {current_data['shape']}"
+                    f"变化！初始化时 {init_data['shape']}当前 {current_data['shape']}"
                 )
                 continue
 
-            # 3. 检查参数哈希值是否一致（判断权重数值是否变化）
             if init_data["hash"] != current_data["hash"]:
                 has_change = True
                 change_log.append(
-                    f"❌ 参数 {param_key} 数值变化："
-                    f"初始化哈希 {init_data['hash']} → 当前哈希 {current_data['hash']}"
+                    f"变化！初始化时{init_data['hash']}，当前哈希{current_data['hash']}"
                 )
             else:
                 if verbose:
-                    change_log.append(f"✅ 参数 {param_key} 无变化（哈希一致）")
+                    change_log.append(f"参数 {param_key} 无变化")
 
         # 打印对比结果
         if verbose:
@@ -357,9 +342,9 @@ class ref_model:
                 print(log)
             print("="*50)
             if not has_change:
-                print("🎉 所有关键参数均无变化，模型状态正常")
+                print("🎉 参数未变化")
             else:
-                print("⚠️  发现参数变化，请检查调用逻辑是否修改模型！")
+                print("⚠️  发现参数变化")
             print("="*50 + "\n")
 
         return has_change
