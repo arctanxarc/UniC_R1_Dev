@@ -154,7 +154,7 @@ class unic_grpo(Trainer):
         self.vq_model=check_dtype(self.vq_model,self.target_dtype)
         self.uni_prompting=uni_prompting
         self.tokenizer=tokenizer
-        self.beta=0.01
+        self.beta=0.0
         self.rate=0.5
         self.epsilon=0.2
         self.split_rate=0.5
@@ -355,18 +355,21 @@ class unic_grpo(Trainer):
                             cla=self.info['class']
                             more_prompt=more_prompt.replace(f"{cla}",f"<{self.args.concept}>")
                             if more_prompt:
+                                # 先按换行符分割，只保留第一行内容
+                                first_line = more_prompt.split('\n', 1)[0]  # 分割一次，取索引0的部分
+                                
                                 # 定义句尾标点，按优先级排序
                                 end_punctuations = ('.', '!', '?')
                                 # 遍历标点，找到第一个出现的句尾标点
                                 for punc in end_punctuations:
-                                    end_idx = more_prompt.find(punc)
+                                    end_idx = first_line.find(punc)
                                     if end_idx != -1:
                                         # 截取到标点后一位（包含标点），作为第一句话
-                                        first_sentence = more_prompt[:end_idx + 1]
+                                        first_sentence = first_line[:end_idx + 1]
                                         break
                                 else:
-                                    # 若没有找到句尾标点，则保留整个字符串
-                                    first_sentence = more_prompt
+                                    # 若没有找到句尾标点，则保留第一行的整个字符串
+                                    first_sentence = first_line
                                 # 更新more_prompt为第一句话
                                 more_prompt = first_sentence
                             if '<|begin_of_box|>' in more_prompt:
@@ -430,18 +433,21 @@ class unic_grpo(Trainer):
                             cla=self.info['class']
                             more_prompt=more_prompt.replace(f"{cla}",f"<{self.args.concept}>")
                             if more_prompt:
+                                # 先按换行符分割，只保留第一行内容
+                                first_line = more_prompt.split('\n', 1)[0]  # 分割一次，取索引0的部分
+                                
                                 # 定义句尾标点，按优先级排序
                                 end_punctuations = ('.', '!', '?')
                                 # 遍历标点，找到第一个出现的句尾标点
                                 for punc in end_punctuations:
-                                    end_idx = more_prompt.find(punc)
+                                    end_idx = first_line.find(punc)
                                     if end_idx != -1:
                                         # 截取到标点后一位（包含标点），作为第一句话
-                                        first_sentence = more_prompt[:end_idx + 1]
+                                        first_sentence = first_line[:end_idx + 1]
                                         break
                                 else:
-                                    # 若没有找到句尾标点，则保留整个字符串
-                                    first_sentence = more_prompt
+                                    # 若没有找到句尾标点，则保留第一行的整个字符串
+                                    first_sentence = first_line
                                 # 更新more_prompt为第一句话
                                 more_prompt = first_sentence
                             if '<|begin_of_box|>' in more_prompt:
@@ -536,7 +542,7 @@ class unic_grpo(Trainer):
                                 simg,stext=clip_model.evaluate_concept(self.args.concept,'',0,prompt=remove_token(condition))
                                 s=simg*0.65+stext*0.35
                             except:
-                                simg,_=clip_model.evaluate_concept(self.args.concept,'',0)
+                                simg=clip_model.evaluate_concept(self.args.concept,'',0)
                                 s=simg
                             logging.info(f"临时图片评分{s}")
                             if s > self.threshold:
@@ -985,10 +991,10 @@ class unic_grpo(Trainer):
                     rrr=self.accelerate_rate-rr
                     delta=0.12*rrr
                     tmp_threshold=self.threshold**(1+delta)
-                    if tmp_threshold-self.threshold>0.01:
-                        self.threshold+=1
-                    if tmp_threshold-self.threshold<-0.01:
-                        self.threshold-=1
+                    if tmp_threshold-self.threshold>0.005:
+                        self.threshold+=0.005
+                    if tmp_threshold-self.threshold<-0.005:
+                        self.threshold-=0.005
                     logging.info(f"threshold turns into {self.threshold}")
                 # for (n1, p1), (n2, p2) in zip(self.model.named_parameters(), self.ref_model.named_parameters()):
                 #     if torch.allclose(p1, p2)!=True:
